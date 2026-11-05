@@ -1925,6 +1925,11 @@ if test "$skip_meson" = no; then
   echo "c = [$(meson_quote $cc $CPU_CFLAGS)]" >> $cross
   test -n "$cxx" && echo "cpp = [$(meson_quote $cxx $CPU_CFLAGS)]" >> $cross
   test -n "$objcc" && echo "objc = [$(meson_quote $objcc $CPU_CFLAGS)]" >> $cross
+  # Objective-C++ is handled by the C++ driver (clang++). Declare it so a cross
+  # build can resolve add_languages('objcpp'); without an objcpp entry Meson
+  # aborts with "compiler binary not defined in cross file". Used by xemu's
+  # macOS Metal present backend (ui/xui/metal-present.mm).
+  test -n "$objcc" && test -n "$cxx" && echo "objcpp = [$(meson_quote $cxx $CPU_CFLAGS)]" >> $cross
   if test "$rust" != disabled; then
     if test "$rust_host_triple" != "$rust_target_triple"; then
       echo "rust = [$(meson_quote $rustc --target "$rust_target_triple")]" >> $cross
