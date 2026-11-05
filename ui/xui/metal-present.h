@@ -93,10 +93,17 @@ extern void *g_metal_framebuffer_texture;
  * tightly packed RGBA8 pixels, mirroring the aspect-correction and flip
  * semantics of the GL screenshot path. Returns false if capture is
  * unavailable (e.g. the screen is blanked). The caller must hold a +1
- * reference on the texture for the duration of this call. */
+ * reference on the texture for the duration of this call.
+ *
+ * When max_width / max_height are non-zero, the target is downscaled to fit
+ * inside that box (preserving aspect), matching ScaleDimensions() in the GL
+ * path. Screenshot callers pass 0/0 for full resolution; snapshot-thumbnail
+ * callers pass the desired box. */
 bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture, bool flip,
                                          std::vector<uint8_t> &rgba,
-                                         int *out_width, int *out_height);
+                                         int *out_width, int *out_height,
+                                         int max_width = 0,
+                                         int max_height = 0);
 #endif
 
 #endif /* __APPLE__ */

@@ -858,6 +858,16 @@ static void gl_render_frame(struct xemu_console *scon)
         void *mtl_texture = nv2a_get_framebuffer_mtl_texture();
         g_metal_framebuffer_texture = mtl_texture;
         xemu_metal_present_blit_framebuffer(mtl_texture, false);
+        // Hand the framebuffer MTLTexture to the snapshot-thumbnail generator
+        // (mirrors the xemu_snapshots_set_framebuffer_texture call in the GL
+        // path below). Done after blit_framebuffer so the presenter's strong
+        // framebufferTexture reference is already holding the object alive
+        // across any savevm that fires on the emulator thread while this
+        // pointer is visible. Flip is false: the Metal presenter establishes
+        // the framebuffer orientation via the gamma pipeline and does not
+        // require an outer V-axis correction for consumers reading it
+        // directly.
+        xemu_snapshots_set_framebuffer_mtl_texture(mtl_texture, false);
 
         xemu_main_loop_lock();
         xemu_hud_update();
@@ -867,6 +877,7 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_metal_present_end_frame(g_config.display.window.vsync);
 
         g_metal_framebuffer_texture = NULL;
+        xemu_snapshots_set_framebuffer_mtl_texture(NULL, false);
         nv2a_release_framebuffer_surface();
         qatomic_set(&rendering, false);
         return;
@@ -1203,7 +1214,19 @@ static void display_early_init(DisplayOptions *o)
     // OpenGL cannot share resources with Metal. Only engage this path when the
     // Vulkan renderer is selected.
     if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_VULKAN) {
-        xemu_metal_present_init(m_window);
+        if (!xemu_metal_present_init(m_window)) {
+            // Metal init can fail here only in pathological environments
+            // (missing NSView, Metal unavailable, MSL compile failure). Silently
+            // continuing would leave the UI on the GL framebuffer-import path
+            // with a null gl_texture_id (Vulkan doesn't create one on Apple),
+            // i.e. a black screen. Downgrade the session to OpenGL so the user
+            // still gets a working display; they can retry Vulkan after
+            // resolving the underlying Metal/runtime issue.
+            fprintf(stderr,
+                    "xemu: Metal presentation init failed; falling back to the "
+                    "OpenGL renderer for this session.\n");
+            g_config.display.renderer = CONFIG_DISPLAY_RENDERER_OPENGL;
+        }
     }
 #endif
     xemu_hud_init(m_window, m_context);

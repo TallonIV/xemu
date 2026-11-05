@@ -23,15 +23,30 @@
 
 #include "xemu-snapshots.h"
 #include "xui/gl-helpers.hh"
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+#include "xui/metal-present.h"
+#endif
 
 static GLuint display_tex = 0;
 static bool display_flip = false;
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+static void *display_mtl_texture = nullptr;
+static bool display_mtl_flip = false;
+#endif
 
 void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip)
 {
     display_tex = tex;
     display_flip = flip;
 }
+
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+void xemu_snapshots_set_framebuffer_mtl_texture(void *mtl_texture, bool flip)
+{
+    display_mtl_texture = mtl_texture;
+    display_mtl_flip = flip;
+}
+#endif
 
 bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size)
 {
@@ -57,6 +72,34 @@ bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size)
 
 void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size)
 {
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    // Metal path: the Vulkan renderer exports its framebuffer as an MTLTexture
+    // and does not populate a GL texture on Apple. Capture the current
+    // framebuffer into RGBA and encode a thumbnail directly. Runs on the same
+    // CAMetalQueue as the presenter; Metal is thread-safe for command-buffer
+    // submission. If the presenter is inactive or the framebuffer is unset,
+    // fall through to the GL check below (which correctly bails when there's
+    // nothing to render).
+    if (display_mtl_texture != nullptr &&
+        xemu_metal_present_is_active()) {
+        std::vector<uint8_t> rgba;
+        int w = 0, h = 0;
+        if (xemu_metal_capture_framebuffer_rgba(
+                display_mtl_texture, display_mtl_flip, rgba, &w, &h,
+                2 * XEMU_SNAPSHOT_THUMBNAIL_WIDTH,
+                2 * XEMU_SNAPSHOT_THUMBNAIL_HEIGHT)) {
+            std::vector<uint8_t> png;
+            if (fpng::fpng_encode_image_to_memory(rgba.data(), w, h, 4, png)) {
+                void *buf = g_malloc(png.size());
+                memcpy(buf, png.data(), png.size());
+                *size = png.size();
+                return buf;
+            }
+        }
+        return NULL;
+    }
+#endif
+
     /*
      * Avoids crashing if a snapshot is made on a thread with no GL context
      * Normally, this is not an issue, but it is better to fail safe than assert

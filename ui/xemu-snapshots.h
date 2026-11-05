@@ -59,6 +59,12 @@ void xemu_snapshots_mark_dirty(void);
 void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
 bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
 void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+// Metal-path counterpart: hands the exported framebuffer MTLTexture (as void*)
+// to the thumbnail generator. Called each frame from ui/xemu.c's Metal branch
+// when no GL framebuffer is available (gl_texture_id is 0 on Apple).
+void xemu_snapshots_set_framebuffer_mtl_texture(void *mtl_texture, bool flip);
+#endif
 
 #ifdef __cplusplus
 }

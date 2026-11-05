@@ -28,6 +28,7 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <unordered_map>
 
 #include "common.hh"
 #include <imgui_impl_metal.h>
@@ -84,14 +85,6 @@ fragment float4 blit_gamma(BlitVSOut in [[stage_in]],
     uint pb = (palette[uint(col.b * 255.0)] >> 16) & 0xffu;
     return float4(float(pr) / 255.0, float(pg) / 255.0, float(pb) / 255.0, col.a);
 }
-
-// Plain passthrough blit used when the CPU-readback fallback provides a texture
-// that has already had gamma applied.
-fragment float4 blit_passthrough(BlitVSOut in [[stage_in]],
-                                 texture2d<float> tex [[texture(0)]],
-                                 sampler smp [[sampler(0)]]) {
-    return tex.sample(smp, in.texcoord);
-}
 )METAL";
 
 // Matches BlitUniforms in the MSL source above. Padded to 48 bytes so the CPU
@@ -130,18 +123,14 @@ static const BlitVertIn kQuadVerts[4] = {
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @property (nonatomic, strong) CAMetalLayer *layer;
 @property (nonatomic, strong) id<MTLRenderPipelineState> gammaPipeline;
-// Passthrough variant used by the screenshot capture path. The source
-// framebuffer is sampled either way, so this pipeline must use the same
-// color attachment format as the capture target (BGRA8Unorm).
-@property (nonatomic, strong) id<MTLRenderPipelineState> passthroughPipeline;
 @property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
 @property (nonatomic, strong) id<MTLBuffer> paletteBuffer;
 @property (nonatomic, strong) id<MTLSamplerState> samplerLinear;
 @property (nonatomic, strong) id<MTLSamplerState> samplerNearest;
 
-// A 1x1 texture used to stand in for HUD overlays that are still backed by
-// OpenGL GLuint ids (icons, logo, snapshots). See xemu_metal_imgui_render_draw_data.
+// A 1x1 transparent texture used as a fallback when a HUD overlay backed by an
+// OpenGL GLuint id cannot be bridged into Metal (see XemuMetalBridgeGLTexture).
 @property (nonatomic, strong) id<MTLTexture> dummyTexture;
 
 // Per-frame state.
@@ -191,6 +180,19 @@ static SDL_Window *g_metal_window = nil;
 static bool g_pending_resize = false;
 static int g_pending_width = 0;
 static int g_pending_height = 0;
+
+// Per-frame cache of Metal textures bridged from OpenGL HUD overlay textures.
+// Keyed by the GLuint id the imgui HUD stores in ImTextureID. The overlay
+// contents (controller masks, XMU, logo, icons, snapshot thumbnails) animate, so
+// the pixel data is refreshed on every render pass, but the backing MTLTexture
+// object is reused whenever the source dimensions are unchanged. Cleared in
+// xemu_metal_present_cleanup().
+struct XemuMetalGLTextureBridge {
+    id<MTLTexture> texture;
+    int width;
+    int height;
+};
+static std::unordered_map<GLuint, XemuMetalGLTextureBridge> g_gl_tex_bridge;
 
 static float XemuMetalDisplayAspectRatio(int width, int height)
 {
@@ -302,6 +304,11 @@ bool xemu_metal_present_init(SDL_Window *window)
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = YES;
         layer.contentsScale = view.window.backingScaleFactor;
+        // Synchronize presentation with CoreAnimation transactions so window
+        // moves, live-resizes, and fullscreen transitions don't tear or show
+        // garbage pixels. SDL3's own Metal view uses YES here; matches the
+        // behavior of the Cocoa GL path.
+        layer.presentsWithTransaction = YES;
 
         // Render the layer into the SDL view's hierarchy.
         view.wantsLayer = YES;
@@ -326,14 +333,6 @@ bool xemu_metal_present_init(SDL_Window *window)
             return false;
         }
 
-        p.passthroughPipeline = BuildPipeline(device,
-                                              [NSString stringWithUTF8String:kBlitMSLSource],
-                                              @"blit_passthrough", &error);
-        if (p.passthroughPipeline == nil) {
-            fprintf(stderr, "xemu_metal_present_init: passthrough pipeline creation failed\n");
-            return false;
-        }
-
         p.vertexBuffer = [device newBufferWithBytes:kQuadVerts
                                              length:sizeof(kQuadVerts)
                                             options:MTLResourceOptionCPUCacheModeDefault];
@@ -345,6 +344,10 @@ bool xemu_metal_present_init(SDL_Window *window)
         p.samplerNearest = MakeSampler(device, MTLSamplerFilterNearest);
 
         // 1x1 placeholder used to neutralize not-yet-ported GL-overlay textures.
+        // Explicitly initialized to transparent black (0,0,0,0) so that any HUD
+        // overlay quad sampling it fades to invisible under imgui's standard
+        // premultiplied blend, rather than painting a solid black rectangle over
+        // the framebuffer or leaking uninitialized bytes.
         MTLTextureDescriptor *dummy_desc = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                          width:1
@@ -352,6 +355,13 @@ bool xemu_metal_present_init(SDL_Window *window)
                                      mipmapped:NO];
         dummy_desc.usage = MTLTextureUsageShaderRead;
         p.dummyTexture = [device newTextureWithDescriptor:dummy_desc];
+        if (p.dummyTexture != nil) {
+            const uint8_t transparent[4] = { 0, 0, 0, 0 };
+            [p.dummyTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                              mipmapLevel:0
+                                withBytes:transparent
+                              bytesPerRow:4];
+        }
 
         // GPU-signaled event used for the Metal-read -> Vulkan-write reverse
         // dependency (see the framebufferReadEvent property comment).
@@ -390,6 +400,9 @@ void xemu_metal_present_cleanup(void)
 
         g_metal.drawable = nil;
         g_metal.framebufferTexture = nil;
+        // Release any Metal textures bridged from OpenGL HUD overlays before the
+        // device goes away (the MTLTexture objects are recreated on demand).
+        g_gl_tex_bridge.clear();
         g_metal = nil;
         g_metal_active = false;
         g_metal_window = nil;
@@ -662,7 +675,8 @@ void xemu_metal_present_end_frame(bool vsync)
 
 bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
                                          std::vector<uint8_t> &rgba,
-                                         int *out_width, int *out_height)
+                                         int *out_width, int *out_height,
+                                         int max_width, int max_height)
 {
     @autoreleasepool {
         if (!g_metal_active) {
@@ -676,15 +690,43 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         }
 
         // Mirror the GL screenshot path (RenderFramebufferToPng): correct the
-        // width to the display aspect ratio, then render 1:1 into an offscreen
-        // target. The GL path reads back bottom-up and flips via !flip on
-        // render; a fresh Metal texture read by getBytes() is top-down, so the
-        // same !flip normalization applies directly.
+        // width to the display aspect ratio, optionally scale down to fit
+        // (max_width x max_height) for snapshot thumbnails, then render into an
+        // offscreen target using the same gamma/DAC-palette pipeline as the
+        // display blit, so the PNG matches both what the user sees and what the
+        // GL path produces. The GL path reads back bottom-up and flips via
+        // !flip on render; a fresh Metal texture read by getBytes() is
+        // top-down, so the same !flip normalization applies directly.
         int width = (int)texture.height * XemuMetalDisplayAspectRatio((int)texture.width,
                                                                       (int)texture.height);
         int height = (int)texture.height;
         if (width <= 0 || height <= 0) {
             return false;
+        }
+
+        if (max_width <= 0) {
+            max_width = width;
+        }
+        if (max_height <= 0) {
+            max_height = height;
+        }
+        {
+            // Scale <width>x<height> proportionally into the max box, matching
+            // ScaleDimensions() in gl-helpers.cc.
+            const float w_ratio = (float)max_width / (float)max_height;
+            const float t_ratio = (float)width / (float)height;
+            int sw, sh;
+            if (w_ratio >= t_ratio) {
+                sw = (int)((float)max_width * t_ratio / w_ratio);
+                sh = max_height;
+            } else {
+                sw = max_width;
+                sh = (int)((float)max_height * w_ratio / t_ratio);
+            }
+            if (sw < 1) sw = 1;
+            if (sh < 1) sh = 1;
+            width = sw;
+            height = sh;
         }
 
         id<MTLTexture> target = nil;
@@ -714,6 +756,21 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
                         length:sizeof(u)
                        options:MTLResourceOptionCPUCacheModeDefault];
 
+        // Build a transient DAC palette LUT so this capture cannot race with the
+        // in-flight on-screen blit that shares g_metal.paletteBuffer. Screenshot
+        // parity with the GL path requires applying the same palette LUT.
+        const uint8_t *pal = nv2a_get_dac_palette();
+        uint32_t pal_lut[256];
+        for (int i = 0; i < 256; i++) {
+            pal_lut[i] = ((uint32_t)pal[i * 3 + 2] << 16) |
+                         ((uint32_t)pal[i * 3 + 1] << 8) |
+                         ((uint32_t)pal[i * 3]);
+        }
+        id<MTLBuffer> palette = [g_metal.device
+            newBufferWithBytes:pal_lut
+                        length:sizeof(pal_lut)
+                       options:MTLResourceOptionCPUCacheModeDefault];
+
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = target;
         pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -722,14 +779,15 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         id<MTLCommandBuffer> cmdbuf = [g_metal.queue commandBuffer];
         id<MTLRenderCommandEncoder> enc =
             [cmdbuf renderCommandEncoderWithDescriptor:pass];
-        if (enc == nil || uniform == nil) {
+        if (enc == nil || uniform == nil || palette == nil) {
             return false;
         }
 
-        [enc setRenderPipelineState:g_metal.passthroughPipeline];
+        [enc setRenderPipelineState:g_metal.gammaPipeline];
         [enc setVertexBuffer:g_metal.vertexBuffer offset:0 atIndex:0];
         [enc setVertexBuffer:uniform offset:0 atIndex:1];
         [enc setFragmentTexture:texture atIndex:0];
+        [enc setFragmentBuffer:palette offset:0 atIndex:0];
         [enc setFragmentSamplerState:g_metal.samplerLinear atIndex:0];
 
         MTLViewport viewport;
@@ -797,13 +855,16 @@ void xemu_metal_imgui_init(void *mtl_device_void)
         // NOTE: xemu applies its own (custom) ImGui style after this returns,
         // so no style is set here.
         //
-        // KNOWN GAP: The imgui Metal backend treats ImTextureID as an
-        // id<MTLTexture>, but the HUD currently passes GLuint texture ids for
-        // overlays (menu icons, controller masks, logo, snapshot thumbnails)
-        // created by the OpenGL helpers in gl-helpers.cc. xemu_metal_imgui_render_draw_data
-        // substitutes a placeholder so these render as a solid quad instead of
-        // crashing; porting them to real Metal textures is the follow-up that
-        // removes that substitution. Text HUD and the framebuffer are unaffected.
+        // The imgui Metal backend treats ImTextureID as an id<MTLTexture>, while
+        // the HUD passes OpenGL GLuint ids for its overlays (menu icons,
+        // controller masks, XMU, logo, snapshot thumbnails) created by the OpenGL
+        // helpers in gl-helpers.cc. Those helpers still run against the GL context
+        // that remains current on this thread, so their FBO textures are live even
+        // while presenting via Metal. xemu_metal_imgui_render_draw_data bridges
+        // each such GLuint into a cached Metal texture (glGetTexImage readback ->
+        // MTLTexture) so the overlays render correctly; a transparent 1x1 dummy is
+        // used only when a texture cannot be read back. Text HUD and the
+        // framebuffer are unaffected.
         ImGui_ImplMetal_Init(device);
     }
 }
@@ -836,6 +897,78 @@ void xemu_metal_imgui_new_frame(void)
     }
 }
 
+// Reads the level-0 image of a currently-live OpenGL texture and uploads it into
+// a cached RGBA8 id<MTLTexture> usable by the imgui Metal backend. The GL
+// context is current on this thread (made current in display_early_init and
+// never unbound on the Metal path), so the direct-GL overlay FBO draws have
+// already populated the source texture this frame. Returns nil when the id is
+// not a live 2D texture with a level-0 image, letting the caller fall back to the
+// dummy. GL state (2D binding, pack alignment) is saved and restored.
+static id<MTLTexture> XemuMetalBridgeGLTexture(GLuint gl_tex, id<MTLDevice> device)
+{
+    GLint saved_binding = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_binding);
+
+    glBindTexture(GL_TEXTURE_2D, gl_tex);
+
+    GLint width = 0, height = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    if (width <= 0 || height <= 0) {
+        glBindTexture(GL_TEXTURE_2D, (GLuint)saved_binding);
+        return nil;
+    }
+
+    auto it = g_gl_tex_bridge.find(gl_tex);
+    if (it == g_gl_tex_bridge.end() || it->second.texture == nil ||
+        it->second.width != (int)width || it->second.height != (int)height) {
+        if (it != g_gl_tex_bridge.end()) {
+            g_gl_tex_bridge.erase(it);
+        }
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:(NSUInteger)width
+                                        height:(NSUInteger)height
+                                     mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+        if (tex == nil) {
+            glBindTexture(GL_TEXTURE_2D, (GLuint)saved_binding);
+            return nil;
+        }
+        // Default-insert the entry (ARC zero-initializes the ObjC pointer
+        // member), then populate it; avoids relying on aggregate
+        // initialization of a struct that holds a __strong id.
+        XemuMetalGLTextureBridge &entry = g_gl_tex_bridge[gl_tex];
+        entry.texture = tex;
+        entry.width = (int)width;
+        entry.height = (int)height;
+        it = g_gl_tex_bridge.find(gl_tex);
+    }
+
+    // Read back tightly packed RGBA8 and upload. glGetTexImage returns the image
+    // with its first row at t=0; the imgui Metal backend samples v=0 from that
+    // same row 0, so a direct (unflipped) copy reproduces the OpenGL path's
+    // orientation for identical imgui draw data.
+    const size_t bytes_per_row = (size_t)width * 4;
+    std::vector<uint8_t> pixels(bytes_per_row * (size_t)height);
+
+    GLint saved_align = 4;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &saved_align);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glPixelStorei(GL_PACK_ALIGNMENT, saved_align);
+
+    [it->second.texture
+        replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height)
+          mipmapLevel:0
+            withBytes:pixels.data()
+          bytesPerRow:(NSUInteger)bytes_per_row];
+
+    glBindTexture(GL_TEXTURE_2D, (GLuint)saved_binding);
+    return it->second.texture;
+}
+
 void xemu_metal_imgui_render_draw_data(void *imgui_draw_data_void)
 {
     @autoreleasepool {
@@ -844,24 +977,30 @@ void xemu_metal_imgui_render_draw_data(void *imgui_draw_data_void)
         }
         ImDrawData *drawData = (ImDrawData *)imgui_draw_data_void;
 
-        // Defensive substitution: some HUD overlays still hand the backend a
-        // OpenGL GLuint stored in an ImTextureID (see the known gap in
-        // xemu_metal_imgui_init). The Metal backend messages ImTextureID as an
-        // id<MTLTexture>, so a small integer would be treated as a bogus object
-        // pointer and crash. Real ObjC object pointers on arm64 are always far
-        // above the page-zero guard region, so any implausibly small value is
-        // replaced with a 1x1 placeholder texture. This keeps the HUD rendering
-        // (text + framebuffer) intact; porting the overlays to Metal is a
-        // follow-up that simply restores their real textures here.
-        if (g_metal.dummyTexture != nil) {
-            for (int n = 0; n < drawData->CmdListsCount; n++) {
-                ImDrawList *list = drawData->CmdLists[n];
-                for (int i = 0; i < list->CmdBuffer.Size; i++) {
-                    ImDrawCmd &cmd = list->CmdBuffer[i];
-                    if ((uintptr_t)cmd.TextureId < 0x10000) {
-                        cmd.TextureId =
-                            (ImTextureID)(__bridge void *)g_metal.dummyTexture;
-                    }
+        // The HUD still hands the Metal backend OpenGL GLuint texture ids for its
+        // overlays (menu icons, controller masks, XMU, logo, snapshot thumbnails),
+        // because those are drawn into FBOs by the OpenGL helpers in
+        // gl-helpers.cc, which remain live on the still-current GL context. Bridge
+        // each implausibly small ImTextureID (a GLuint; real ObjC object pointers
+        // such as the imgui font atlas sit far above the page-zero guard region on
+        // arm64 and are left untouched) into a cached Metal texture via readback.
+        // Textures that cannot be read back fall back to the transparent dummy.
+        id<MTLDevice> device = g_metal.device;
+        for (int n = 0; n < drawData->CmdListsCount; n++) {
+            ImDrawList *list = drawData->CmdLists[n];
+            for (int i = 0; i < list->CmdBuffer.Size; i++) {
+                ImDrawCmd &cmd = list->CmdBuffer[i];
+                const uintptr_t tex_id = (uintptr_t)cmd.TextureId;
+                if (tex_id == 0 || tex_id >= 0x10000) {
+                    continue;
+                }
+                id<MTLTexture> bridged =
+                    XemuMetalBridgeGLTexture((GLuint)tex_id, device);
+                if (bridged == nil) {
+                    bridged = g_metal.dummyTexture;
+                }
+                if (bridged != nil) {
+                    cmd.TextureId = (ImTextureID)(__bridge void *)bridged;
                 }
             }
         }
