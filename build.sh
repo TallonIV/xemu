@@ -95,6 +95,12 @@ debug_opts=''
 build_cflags=''
 default_job_count='12'
 sys_ldflags=''
+# Set to "yes" by platforms that export the toolchain flags in CFLAGS (so that
+# configure already sees them as $CFLAGS); their value must then NOT also be
+# forwarded via --extra-cflags or every flag would be duplicated on the command
+# line. Defaults to "no" so platforms that only set CFLAGS as a shell variable
+# (e.g. Windows) still get their flags forwarded.
+exported_cflags='no'
 
 get_job_count () {
 	if command -v 'nproc' >/dev/null
@@ -224,6 +230,7 @@ case "$platform" in # Adjust compilation options based on platform
                        -isysroot ${sdk} \
                        -I${lib_prefix}/include \
                        -mmacosx-version-min=$macos_min_ver"
+        exported_cflags='yes'
         export LDFLAGS="${LDFLAGS} \
                         -arch ${target_arch} \
                         -isysroot ${sdk}"
@@ -259,8 +266,19 @@ configure="${project_source_dir}/configure"
 
 set -x # Print commands from now on
 
+# When the platform already exports the toolchain flags in CFLAGS (macOS),
+# configure reads them directly as $CFLAGS, so do not forward them again through
+# --extra-cflags; otherwise every flag (e.g. -arch / -isysroot) appears twice on
+# each command line. Other platforms set CFLAGS only as a shell variable, so it
+# must be forwarded explicitly.
+if test "$exported_cflags" = "yes"; then
+    cli_cflags=""
+else
+    cli_cflags="${CFLAGS}"
+fi
+
 "${configure}" \
-    --extra-cflags="-DXBOX=1 ${build_cflags} ${sys_cflags} ${CFLAGS}" \
+    --extra-cflags="-DXBOX=1 ${build_cflags} ${sys_cflags} ${cli_cflags}" \
     --extra-ldflags="${sys_ldflags}" \
     --target-list=i386-softmmu \
     ${opts} \

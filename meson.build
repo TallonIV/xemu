@@ -498,7 +498,13 @@ endif
 #
 # Emscripten doesn't support -no-pie but meson can't catch the compiler
 # warning. So explicitly omit the flag for Emscripten.
-if not get_option('b_pie') and host_os != 'emscripten'
+#
+# Apple clang likewise treats -no-pie as a link-only driver flag: passing it on
+# a compile (-c) line is reported as "argument unused during compilation" and,
+# with -Werror=unused-command-line-argument, turns the capability probe into a
+# hard error. The distro-specs workaround below is irrelevant on macOS, where
+# Meson's own b_pie handling governs PIE, so omit it for Darwin too.
+if not get_option('b_pie') and host_os != 'emscripten' and host_os != 'darwin'
   qemu_common_flags += cc.get_supported_arguments('-fno-pie', '-no-pie')
 endif
 
