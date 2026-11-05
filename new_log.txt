@@ -1,0 +1,1 @@
+"/path/xemu.app/Contents/MacOS/xemu" 2>&1 | grep -Ei "available physical devices|required .*not supported|no supported depth|Apple M4|suitable GPU"
