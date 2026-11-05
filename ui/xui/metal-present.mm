@@ -435,17 +435,40 @@ void xemu_metal_present_begin_frame(void)
     @autoreleasepool {
         assert(g_metal_active);
 
-        // Reverse-direction synchronization: ensure the previous frame's Metal
-        // blit has finished SAMPLING the shared framebuffer MTLTexture before
-        // the caller lets the Vulkan renderer overwrite it (get_framebuffer ->
-        // pgraph sync). We wait on the GPU-signaled event value rather than the
-        // whole command buffer, so the previous frame's HUD compositing and
-        // presentation overlap with this frame's Vulkan rendering. This is the
-        // CPU/GPU-overlap analog of removing a glFinish() in the GL path.
+        if (g_pending_resize) {
+            ApplyLayerSize(g_metal, g_pending_width, g_pending_height);
+            g_pending_resize = false;
+        }
+
+        // Acquire the drawable first. nextDrawable() blocks until a free
+        // drawable is available (vsync pacing when displaySyncEnabled), and we
+        // do not touch the shared framebuffer texture here, so the GPU is free
+        // to finish the *previous* frame's blit while the CPU waits on vblank.
+        id<CAMetalDrawable> drawable = [g_metal.layer nextDrawable];
+        if (drawable == nil) {
+            fprintf(stderr, "xemu_metal_present_begin_frame: no drawable\n");
+            return;
+        }
+        g_metal.drawable = drawable;
+
+        // Reverse-direction synchronization (single shared framebuffer image):
+        // the caller invokes get_framebuffer() only AFTER this returns, and that
+        // call lets the Vulkan renderer overwrite the framebuffer MTLTexture.
+        // We must not proceed until the previous frame's Metal blit finished
+        // SAMPLING it. Signalling happens during the prior blit (early in that
+        // frame) and the nextDrawable() wait above has usually already let it
+        // drain, so in the steady state (vsync on) this returns immediately
+        // instead of serializing the CPU behind the GPU. This is the practical
+        // analog of removing the GL path's glFinish().
         //
-        // get_framebuffer() is only called after this returns, and the event is
-        // signaled during the prior frame's blit (early in that frame), so in
-        // the steady state this wait is already satisfied and returns at once.
+        // Full producer/consumer overlap with vsync DISABLED would additionally
+        // require framebuffer depth in the renderer (a ring of exported
+        // MTLTextures) or a Vulkan-side wait on this MTLSharedEvent imported as
+        // an external semaphore. Both are intentionally deferred: the former
+        // couples slot indices across the C/Metal boundary in a path we cannot
+        // verify on target hardware, and the latter depends on driver support
+        // the KosmicKrisp gate has not yet confirmed. See PR4-followup.
+        //
         // The generous timeout is only a hang-safety valve (it must never
         // trigger); if it does we log and proceed rather than wedge the UI
         // thread, at the cost of at most a single-frame glitch.
@@ -461,21 +484,10 @@ void xemu_metal_present_begin_frame(void)
             g_metal.framebufferReadWaited = g_metal.framebufferReadSeq;
         }
 
-        if (g_pending_resize) {
-            ApplyLayerSize(g_metal, g_pending_width, g_pending_height);
-            g_pending_resize = false;
-        }
-
-        id<CAMetalDrawable> drawable = [g_metal.layer nextDrawable];
-        if (drawable == nil) {
-            fprintf(stderr, "xemu_metal_present_begin_frame: no drawable\n");
-            return;
-        }
-        g_metal.drawable = drawable;
-
         g_metal.commandBuffer = [g_metal.queue commandBuffer];
         if (g_metal.commandBuffer == nil) {
             fprintf(stderr, "xemu_metal_present_begin_frame: no command buffer\n");
+            g_metal.drawable = nil;
             return;
         }
 
