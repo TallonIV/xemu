@@ -188,7 +188,13 @@ def main():
 		'libepoxy',
 		'libpcap',
 		'libslirp',
-		'libusb'])
+		'libusb',
+		# Vulkan loader + headers (pulls in vulkan-headers and MoltenVK via
+		# @pkgdep). Installs opt/local/lib/pkgconfig/vulkan.pc so that
+		# meson's dependency('vulkan') resolves on the pinned PKG_CONFIG_LIBDIR,
+		# which in turn enables the NV2A Vulkan renderer and the Metal present
+		# backend on Apple Silicon.
+		'vulkan-loader'])
 
 if __name__ == '__main__':
 	main()
