@@ -24,7 +24,7 @@
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
 #include <objc/runtime.h>
-#include <SDL3/SDL.h>
+#include <dlfcn.h>
 #endif
 
 #define VkExtensionPropertiesArray GArray
@@ -169,33 +169,47 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     VkResult result;
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* On macOS, locate and load the Vulkan loader through SDL3, which probes
-     * the system, framework and Homebrew locations and honors loader discovery
-     * env vars. volkInitialize()'s default path only dlopens the bare soname
-     * "libvulkan.1.dylib", which a Finder/launchd-launched .app cannot resolve
-     * when the loader is intentionally left unbundled (see the macOS Vulkan
-     * driver delivery model). SDL's vkGetInstanceProcAddr is then handed to
-     * volk via volkInitializeCustom. */
-    if (SDL_Vulkan_LoadLibrary(NULL) != 0) {
-        error_setg(errp, "SDL_Vulkan_LoadLibrary failed: %s", SDL_GetError());
+    /* Locate and load the Vulkan loader explicitly. A Finder/launchd-launched
+     * .app receives no DYLD_* search paths and the loader is intentionally not
+     * bundled, so volkInitialize()'s default bare-soname dlopen cannot find a
+     * Homebrew/MoltenVK/system-installed loader. Probe the common install
+     * locations (honoring an optional VULKAN_LIBRARY hint), resolve
+     * vkGetInstanceProcAddr, and hand it to volk. */
+    static const char *const loader_candidates[] = {
+        "libvulkan.1.dylib", /* bundled, or reachable via an embedded rpath */
+        "/opt/homebrew/lib/libvulkan.1.dylib",
+        "/usr/local/lib/libvulkan.1.dylib",
+        "/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib",
+        "/usr/local/opt/vulkan-loader/lib/libvulkan.1.dylib",
+        "libMoltenVK.dylib",
+    };
+
+    const char *override_path = getenv("VULKAN_LIBRARY");
+    void *lib = NULL;
+    if (override_path && *override_path) {
+        lib = dlopen(override_path, RTLD_NOW | RTLD_LOCAL);
+    }
+    for (size_t i = 0; !lib && i < ARRAY_SIZE(loader_candidates); i++) {
+        lib = dlopen(loader_candidates[i], RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!lib) {
+        error_setg(errp, "Failed to locate the Vulkan loader; install a Vulkan "
+                         "loader/MoltenVK or set VULKAN_LIBRARY");
         return false;
     }
 
     PFN_vkGetInstanceProcAddr get_proc_addr =
-        (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+        (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
     if (!get_proc_addr) {
-        error_setg(errp, "SDL_Vulkan_GetVkGetInstanceProcAddr failed: %s",
-                   SDL_GetError());
-        SDL_Vulkan_UnloadLibrary();
+        error_setg(errp, "vkGetInstanceProcAddr not found in Vulkan loader");
+        dlclose(lib);
         return false;
     }
 
-    result = volkInitializeCustom(get_proc_addr);
-    if (result != VK_SUCCESS) {
-        error_setg(errp, "volkInitializeCustom failed");
-        SDL_Vulkan_UnloadLibrary();
-        return false;
-    }
+    /* volkInitializeCustom returns void (it cannot fail once given a valid
+     * vkGetInstanceProcAddr); remember the handle to dlclose() on finalize. */
+    r->vulkan_library_handle = lib;
+    volkInitializeCustom(get_proc_addr);
 #else
     result = volkInitialize();
     if (result != VK_SUCCESS) {
@@ -799,8 +813,10 @@ void pgraph_vk_finalize_instance(PGRAPHState *pg)
     volkFinalize();
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* Balance the loader reference taken by SDL_Vulkan_LoadLibrary() in
-     * create_instance(). Safe even if the library was never loaded. */
-    SDL_Vulkan_UnloadLibrary();
+    /* Release the dlopen()'ed Vulkan loader acquired in create_instance(). */
+    if (r->vulkan_library_handle) {
+        dlclose(r->vulkan_library_handle);
+        r->vulkan_library_handle = NULL;
+    }
 #endif
 }

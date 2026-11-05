@@ -345,6 +345,9 @@ typedef struct PGRAPHVkState {
     // Metal Interop (VK_EXT_metal_objects). Retained reference to the
     // safe-returned device (see create_logical_device()).
     MTLDevice_id mtl_device;
+
+    // Handle of the dlopen()'ed Vulkan loader (macOS loader discovery).
+    void *vulkan_library_handle;
 #endif
 
     VkPhysicalDevice physical_device;
