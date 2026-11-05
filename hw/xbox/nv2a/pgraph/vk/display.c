@@ -543,7 +543,11 @@ static void destroy_current_display_image(PGRAPHState *pg)
 
     destroy_frame_buffer(pg);
 
-#if HAVE_EXTERNAL_MEMORY
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* The MTLTexture is owned by the VkImage and released when the image is
+     * destroyed below; just drop our reference. */
+    d->mtl_texture = NULL;
+#elif HAVE_EXTERNAL_MEMORY
     glDeleteTextures(1, &d->gl_texture_id);
     d->gl_texture_id = 0;
 
@@ -583,7 +587,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     const GLint gl_internal_format = GL_RGBA8;
     bool use_optimal_tiling = true;
 
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_EXTERNAL_MEMORY && !defined(__APPLE__)
     GLint num_tiling_types;
     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
@@ -619,6 +623,16 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* Declare that this image's underlying MTLTexture should be exportable via
+     * VK_EXT_metal_objects. The handle is fetched after memory binding. */
+    VkExportMetalObjectCreateInfoEXT export_metal_texture_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+        .pNext = NULL,
+        .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+    };
+    image_create_info.pNext = &export_metal_texture_info;
+#else
     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
 #ifdef WIN32
@@ -628,6 +642,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
     };
     image_create_info.pNext = &external_memory_image_create_info;
+#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -643,6 +658,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
 
+#if !(defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT))
     VkExportMemoryAllocateInfo export_memory_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
         .handleTypes =
@@ -654,6 +670,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
             ,
     };
     alloc_info.pNext = &export_memory_alloc_info;
+#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -671,7 +688,25 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     VK_CHECK(vkCreateImageView(r->device, &image_view_create_info, NULL,
                                &d->image_view));
 
-#if HAVE_EXTERNAL_MEMORY
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    VkExportMetalTextureInfoEXT metal_texture_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+        .pNext = NULL,
+        .image = d->image,
+        .imageView = VK_NULL_HANDLE,
+        .bufferView = VK_NULL_HANDLE,
+        .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+        .mtlTexture = NULL,
+    };
+    VkExportMetalObjectsInfoEXT metal_objects_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+        .pNext = &metal_texture_info,
+    };
+    vkExportMetalObjectsEXT(r->device, &metal_objects_info);
+    d->mtl_texture = metal_texture_info.mtlTexture;
+    assert(d->mtl_texture);
+    d->gl_texture_id = 0;
+#elif HAVE_EXTERNAL_MEMORY
 
 #ifdef WIN32
 

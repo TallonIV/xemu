@@ -28,3 +28,8 @@ xemu_ss.add([curl, files('github-issue.cc')])
 if host_os == 'windows'
   xemu_ss.add(files('update.cc', 'win32-dxgi-present.cc'))
 endif
+
+if host_os == 'darwin' and vulkan.found()
+  # Native Metal presentation backend for the Vulkan renderer (Apple Silicon).
+  xemu_ss.add(files('metal-present.mm'))
+endif

@@ -38,6 +38,9 @@
 #include "gl-helpers.hh"
 #include "input-manager.hh"
 #include "snapshot-manager.hh"
+#ifdef __APPLE__
+#include "metal-present.h"
+#endif
 #include "viewport-manager.hh"
 #include "font-manager.hh"
 #include "scene.hh"
@@ -144,8 +147,18 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     io.IniFilename = NULL;
 
     // Setup Platform/Renderer bindings
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        ImGui_ImplSDL3_InitForMetal(window);
+        xemu_metal_imgui_init(NULL);
+    } else {
+        ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
+        ImGui_ImplOpenGL3_Init("#version 150");
+    }
+#else
     ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
     ImGui_ImplOpenGL3_Init("#version 150");
+#endif
     ImPlot::CreateContext();
 
 #if defined(_WIN32)
@@ -161,7 +174,15 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        xemu_metal_imgui_shutdown();
+    } else {
+        ImGui_ImplOpenGL3_Shutdown();
+    }
+#else
     ImGui_ImplOpenGL3_Shutdown();
+#endif
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
@@ -206,10 +227,24 @@ void xemu_hud_update(void)
     if (!first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+        if (!xemu_metal_present_is_active()) {
+            RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+        }
+#else
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+#endif
     }
 
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        xemu_metal_imgui_new_frame();
+    } else {
+        ImGui_ImplOpenGL3_NewFrame();
+    }
+#else
     ImGui_ImplOpenGL3_NewFrame();
+#endif
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -325,11 +360,25 @@ void xemu_hud_update(void)
 void xemu_hud_render()
 {
     ImGui::Render();
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        xemu_metal_imgui_render_draw_data(ImGui::GetDrawData());
+    } else {
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
+#else
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+#endif
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+        if (!xemu_metal_present_is_active()) {
+            SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+        }
+#else
         SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+#endif
     }
 
     if (g_screenshot_pending) {

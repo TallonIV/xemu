@@ -133,6 +133,10 @@ typedef struct PGRAPHRenderer {
         void (*set_surface_scale_factor)(NV2AState *d, unsigned int scale);
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
+#ifdef __APPLE__
+        void *(*get_framebuffer_mtl_texture)(NV2AState *d);
+        void *(*get_mtl_device)(NV2AState *d);
+#endif
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;

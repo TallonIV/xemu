@@ -65,6 +65,10 @@
 #include "xui/win32-dxgi-present.h"
 #endif
 
+#ifdef __APPLE__
+#include "xui/metal-present.h"
+#endif
+
 #ifndef DEBUG_XEMU_C
 #define DEBUG_XEMU_C 0
 #endif
@@ -556,6 +560,13 @@ static void handle_windowevent(SDL_Event *ev)
         }
         break;
 #endif
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        if (xemu_metal_present_is_active()) {
+            xemu_metal_present_resize(ev->window.data1, ev->window.data2);
+        }
+        break;
+#endif
 
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
@@ -824,6 +835,31 @@ static void gl_render_frame(struct xemu_console *scon)
     if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
         return;
     }
+
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        // Native Metal path: composite the HUD on top of the Vulkan renderer's
+        // exported MTLTexture, then present the CAMetalLayer drawable.
+        //
+        // begin_frame() first so it can wait for the previous frame's Metal
+        // sampling to finish before the renderer overwrites the shared texture.
+        xemu_metal_present_begin_frame();
+
+        void *mtl_texture = nv2a_get_framebuffer_mtl_texture();
+        xemu_metal_present_blit_framebuffer(mtl_texture, false);
+
+        xemu_main_loop_lock();
+        xemu_hud_update();
+        xemu_main_loop_unlock();
+
+        xemu_hud_render();
+        xemu_metal_present_end_frame(g_config.display.window.vsync);
+
+        nv2a_release_framebuffer_surface();
+        qatomic_set(&rendering, false);
+        return;
+    }
+#endif
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
@@ -1149,6 +1185,15 @@ static void display_early_init(DisplayOptions *o)
 #ifdef _WIN32
     win32_dxgi_present_init(m_window);
 #endif
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    // The Vulkan renderer exports its framebuffer as an MTLTexture; on Apple
+    // Silicon we present it (and the HUD) natively via Metal, because Apple's
+    // OpenGL cannot share resources with Metal. Only engage this path when the
+    // Vulkan renderer is selected.
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_VULKAN) {
+        xemu_metal_present_init(m_window);
+    }
+#endif
     xemu_hud_init(m_window, m_context);
 }
 
@@ -1235,6 +1280,9 @@ static void display_finalize(void)
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
 #ifdef _WIN32
     win32_dxgi_present_cleanup();
+#endif
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    xemu_metal_present_cleanup();
 #endif
     SDL_GL_MakeCurrent(NULL, NULL);
     SDL_GL_DestroyContext(m_context);

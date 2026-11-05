@@ -294,6 +294,11 @@ typedef struct PGRAPHVkDisplayState {
 #endif
     GLuint gl_memory_obj;
     GLuint gl_texture_id;
+
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    // Metal Interop (VK_EXT_metal_objects)
+    MTLTexture_id mtl_texture;
+#endif
 } PGRAPHVkDisplayState;
 
 typedef struct ComputePipelineKey {
@@ -327,6 +332,11 @@ typedef struct PGRAPHVkState {
     bool debug_utils_extension_enabled;
     bool custom_border_color_extension_enabled;
     bool memory_budget_extension_enabled;
+
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    bool external_memory_metal_extension_enabled;
+    MTLDevice_id mtl_device;
+#endif
 
     VkPhysicalDevice physical_device;
     VkPhysicalDeviceFeatures enabled_physical_device_features;

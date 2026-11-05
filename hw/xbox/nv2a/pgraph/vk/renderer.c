@@ -204,6 +204,43 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
 #endif
 }
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+static void *pgraph_vk_get_framebuffer_mtl_texture(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    qemu_mutex_lock(&d->pfifo.lock);
+
+    VGADisplayParams vga_display_params;
+    d->vga.get_params(&d->vga, &vga_display_params);
+
+    SurfaceBinding *surface = pgraph_vk_surface_get_within(
+        d, d->pcrtc.start + vga_display_params.line_offset);
+    if (surface == NULL || !surface->color) {
+        qemu_mutex_unlock(&d->pfifo.lock);
+        return NULL;
+    }
+
+    assert(surface->color);
+    surface->frame_time = pg->frame_time;
+
+    qemu_event_reset(&pg->sync_complete);
+    qatomic_set(&pg->sync_pending, true);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(&pg->sync_complete);
+
+    return r->display.mtl_texture;
+}
+
+static void *pgraph_vk_get_mtl_device(NV2AState *d)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    return r->mtl_device;
+}
+#endif
+
 static PGRAPHRenderer pgraph_vk_renderer = {
     .type = CONFIG_DISPLAY_RENDERER_VULKAN,
     .name = "Vulkan",
@@ -229,6 +266,10 @@ static PGRAPHRenderer pgraph_vk_renderer = {
         .set_surface_scale_factor = pgraph_vk_set_surface_scale_factor,
         .get_surface_scale_factor = pgraph_vk_get_surface_scale_factor,
         .get_framebuffer_surface = pgraph_vk_get_framebuffer_surface,
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+        .get_framebuffer_mtl_texture = pgraph_vk_get_framebuffer_mtl_texture,
+        .get_mtl_device = pgraph_vk_get_mtl_device,
+#endif
         .get_gpu_properties = pgraph_vk_get_gpu_properties,
     }
 };

@@ -18,6 +18,9 @@
 //
 #include "font-manager.hh"
 #include "viewport-manager.hh"
+#ifdef __APPLE__
+#include "metal-present.h"
+#endif
 
 #include "data/Roboto-Medium.ttf.h"
 #include "data/RobotoCondensed-Regular.ttf.h"
@@ -99,8 +102,17 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+    if (xemu_metal_present_is_active()) {
+        xemu_metal_imgui_recreate_font_texture();
+    } else {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+    }
+#else
     ImGui_ImplOpenGL3_DestroyFontsTexture();
     ImGui_ImplOpenGL3_CreateFontsTexture();
+#endif
 }
 
 void FontManager::Update()

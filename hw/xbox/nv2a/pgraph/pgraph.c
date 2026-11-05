@@ -391,6 +391,40 @@ int nv2a_get_framebuffer_surface(void)
     return s;
 }
 
+#ifdef __APPLE__
+void *nv2a_get_framebuffer_mtl_texture(void)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+    void *s = NULL;
+
+    qemu_mutex_lock(&pg->renderer_lock);
+    assert(!pg->framebuffer_in_use);
+    pg->framebuffer_in_use = true;
+    if (pg->renderer->ops.get_framebuffer_mtl_texture) {
+        s = pg->renderer->ops.get_framebuffer_mtl_texture(d);
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+
+    return s;
+}
+
+void *nv2a_get_mtl_device(void)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+    void *dev = NULL;
+
+    qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->renderer->ops.get_mtl_device) {
+        dev = pg->renderer->ops.get_mtl_device(d);
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+
+    return dev;
+}
+#endif
+
 void nv2a_release_framebuffer_surface(void)
 {
     NV2AState *d = g_nv2a;

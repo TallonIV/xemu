@@ -35,6 +35,12 @@ static char const *const required_device_extensions[] = {
 #ifdef WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+#elif defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* On Apple Silicon the framebuffer is handed to the Metal compositor via
+     * VK_EXT_metal_objects. Requiring it here makes driver support an explicit
+     * gate: if the ICD (e.g. KosmicKrisp) does not expose it, Vulkan renderer
+     * initialization fails cleanly and the user remains on OpenGL. */
+    VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
@@ -339,6 +345,12 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    r->external_memory_metal_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME);
+#endif
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -621,6 +633,35 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
     }
 
     vkGetDeviceQueue(r->device, indices.queue_family, 0, &r->queue);
+
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* Export the underlying MTLDevice so the Metal presentation layer can
+     * create pipelines on the same device that owns the exported MTLTextures. */
+    VkExportMetalDeviceInfoEXT metal_device_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
+        .pNext = NULL,
+    };
+    VkExportMetalObjectsInfoEXT metal_objects_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+        .pNext = &metal_device_info,
+    };
+    vkExportMetalObjectsEXT(r->device, &metal_objects_info);
+    r->mtl_device = metal_device_info.mtlDevice;
+
+    /* Feasibility gate result (macOS Metal present path). VK_EXT_metal_objects
+     * is a required device extension, so reaching this point means it is
+     * present; image MTLTexture export is validated later in the display path. */
+    fprintf(stderr,
+            "Metal interop gate: VK_EXT_metal_objects=required+enabled, "
+            "VK_EXT_external_memory_metal=%s, MTLDevice export=%s\n",
+            r->external_memory_metal_extension_enabled ? "present" : "absent",
+            r->mtl_device ? "ok" : "failed");
+    if (!r->mtl_device) {
+        error_setg(errp, "Failed to export MTLDevice via VK_EXT_metal_objects");
+        return false;
+    }
+#endif
+
     return true;
 }
 

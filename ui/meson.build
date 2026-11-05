@@ -45,6 +45,12 @@ subdir('xui')
 if host_os == 'darwin'
   xemu_cocoa = dependency('appleframeworks', modules: 'Cocoa')
   xemu_ss.add(xemu_cocoa)
+  if vulkan.found()
+    # Frameworks required by the native Metal presentation backend.
+    xemu_metal_fw = dependency('appleframeworks',
+                               modules: ['Metal', 'QuartzCore', 'CoreFoundation'])
+    xemu_ss.add(xemu_metal_fw)
+  endif
 endif
 
 if host_os == 'linux'

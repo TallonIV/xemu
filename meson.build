@@ -2391,6 +2391,14 @@ if host_os == 'windows'
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
 elif host_os == 'linux'
   vulkan = dependency('vulkan')
+elif host_os == 'darwin' and host_machine.cpu_family() == 'aarch64'
+  # KosmicKrisp is a Vulkan-on-Metal driver for Apple Silicon (requires macOS 26+).
+  # Only enable when a Vulkan loader is discoverable; degrade gracefully otherwise.
+  darwin_vulkan = dependency('vulkan', required: false)
+  if darwin_vulkan.found()
+    vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_METAL_EXT'],
+                                 dependencies: darwin_vulkan)
+  endif
 endif
 
 if vulkan.found()
@@ -2413,6 +2421,8 @@ if vulkan.found()
   volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
   if host_os == 'windows'
     volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
+  elif host_os == 'darwin'
+    volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_METAL_EXT=1')
   endif
   volk_subproj = cmake.subproject('volk', options: volk_opts)
   volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],
@@ -2437,6 +2447,20 @@ endif
 
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
+if host_os == 'darwin' and vulkan.found()
+  # The Metal presentation backend (ui/xui/metal-present.mm) is Objective-C++
+  # (.mm). The objcpp language is not part of the default project languages, so
+  # enable it for xemu's own targets. imgui_impl_metal.mm (pulled in via the imgui
+  # subproject below when metal=enabled) is written for ARC, and metal-present.mm
+  # is written to compile under ARC, so enable -fobjc-arc for objcpp translation
+  # units. Note add_global_arguments only reaches this (root) project's targets;
+  # the imgui subproject applies -fobjc-arc to its own .mm via the packagefiles
+  # patch (subprojects/packagefiles/imgui/meson.build). This only affects .mm
+  # files (the rest of xemu's Objective-C is .m / non-ARC and is left untouched).
+  add_languages('objcpp', native: false)
+  add_global_arguments('-fobjc-arc', language: 'objcpp')
+endif
+
 imgui_proj = subproject('imgui', required: true,
                          default_options: [
                            'default_library=static',
@@ -2444,7 +2468,10 @@ imgui_proj = subproject('imgui', required: true,
                            'dx10=disabled',
                            'dx11=disabled',
                            'dx12=disabled',
-                           'metal=disabled',
+                           # NOTE: imgui's Metal backend (imgui_impl_metal.mm) requires Objective-C ARC and
+                           # the objcpp language. Upstream does not enable either, so subprojects/packagefiles/
+                           # imgui/meson.build patches them in; metal=enabled only takes effect via that patch.
+                           'metal=' + (host_os == 'darwin' and vulkan.found() ? 'enabled' : 'disabled'),
                            'opengl=enabled',
                            'sdl2_renderer=disabled',
                            'sdl3_renderer=disabled',
