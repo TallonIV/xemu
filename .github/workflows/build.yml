@@ -11,6 +11,13 @@ on:
       pkg_version:
         description: Build version
         value: ${{ jobs.source.outputs.pkg_version }}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (commit, branch, or tag) to build
+        required: true
+        type: string
+        default: master
 
 jobs:
   source:
