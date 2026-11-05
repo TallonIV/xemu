@@ -22,6 +22,40 @@ package_wincross() {
     python3 ./scripts/gen-license.py --platform windows > dist/LICENSE.txt
 }
 
+# Print each LC_RPATH path embedded in a Mach-O binary (duplicates preserved).
+get_rpaths() {
+    otool -l "$1" | awk '
+        /LC_RPATH/ { capture = 1; next }
+        capture && /^[[:space:]]*path[[:space:]]/ { print $2; capture = 0 }
+    '
+}
+
+# Collapse duplicate LC_RPATH commands into a single unique entry each. macOS
+# 26 (Tahoe) dyld aborts at launch on "duplicate LC_RPATH", so any binary whose
+# rpaths were emitted more than once must be de-duplicated before it is signed.
+dedupe_rpaths() {
+    local target="$1"
+    local unique rpath
+    unique="$(get_rpaths "${target}" | sort -u)"
+    if [ -z "${unique}" ]; then
+        return 0
+    fi
+
+    # Drop every rpath occurrence ...
+    while rpath="$(get_rpaths "${target}" | head -n 1)"; [ -n "${rpath}" ]; do
+        if ! install_name_tool -delete_rpath "${rpath}" "${target}"; then
+            break
+        fi
+    done
+
+    # ... then re-add each unique value exactly once.
+    while IFS= read -r rpath; do
+        if [ -n "${rpath}" ]; then
+            install_name_tool -add_rpath "${rpath}" "${target}"
+        fi
+    done <<< "${unique}"
+}
+
 package_macos() {
     rm -rf dist
 
@@ -74,6 +108,17 @@ package_macos() {
 
     plutil -replace CFBundleShortVersionString -string "${xemu_version}" dist/xemu.app/Contents/Info.plist
     plutil -replace CFBundleVersion            -string "${xemu_version}" dist/xemu.app/Contents/Info.plist
+
+    # De-duplicate any repeated LC_RPATH load commands (dylibbundler can emit
+    # the -p prefix more than once); macOS 26 dyld aborts at launch otherwise.
+    # Runs before the final codesign since install_name_tool invalidates the
+    # existing signature.
+    dedupe_rpaths "${exe_path}"
+    for dylib in "dist/xemu.app/Contents/Libraries/${target_arch}"/*.dylib; do
+        if [ -e "${dylib}" ]; then
+            dedupe_rpaths "${dylib}"
+        fi
+    done
 
     codesign --force --deep --preserve-metadata=entitlements,requirements,flags,runtime --sign - "${exe_path}"
     python3 ./scripts/gen-license.py --version-file=macos-libs/$target_arch/INSTALLED > dist/LICENSE.txt
