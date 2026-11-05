@@ -46,6 +46,11 @@ static char const *const required_device_extensions[] = {
      * gate: if the ICD (e.g. KosmicKrisp) does not expose it, Vulkan renderer
      * initialization fails cleanly and the user remains on OpenGL. */
     VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
+    /* Metal exposes only the reversed-order ABGR4 packed format
+     * (VK_FORMAT_A4B4G4R4_UNORM_PACK16) instead of BGRA4444, so the
+     * VK_EXT_4444_formats extension is required (and enabled on the device)
+     * for the A4R4G4B4 texture remapping in constants.h. */
+    VK_EXT_4444_FORMATS_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
