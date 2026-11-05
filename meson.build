@@ -816,6 +816,28 @@ if 'objc' in all_languages
   # Note sanitizer flags are not applied to Objective-C sources!
   add_project_arguments(objc.get_supported_arguments(warn_flags), native: false, language: 'objc')
 endif
+if host_os == 'darwin'
+  # xemu's native Metal presentation backend (ui/xui/metal-present.mm) is
+  # Objective-C++ (.mm) and is written for Automatic Reference Counting, so
+  # enable the objcpp language and -fobjc-arc here. This must happen before the
+  # first build target is declared (add_project_arguments is disallowed once a
+  # target exists), which is why it lives with the other compiler-flag setup
+  # rather than next to the Metal sources. The flag is only actually used when
+  # the Metal path is built (vulkan.found()); otherwise no .mm is compiled and
+  # it is simply unused. imgui_impl_metal.mm gets ARC from its own packagefiles
+  # patch, so this only needs to cover xemu's own .mm targets.
+  add_languages('objcpp', native: false)
+  add_project_arguments('-fobjc-arc', native: false, language: 'objcpp')
+  # objcpp is not in all_languages, so it does not inherit the project-wide
+  # -iquote include roots below. Re-add the source-root paths here so quoted
+  # includes like "ui/xemu-widescreen.h" resolve in .mm translation units
+  # (generated headers such as config-host.h still arrive via the target's
+  # own include_directories, which apply to every language).
+  add_project_arguments('-iquote', '.',
+                        '-iquote', meson.current_source_dir(),
+                        '-iquote', meson.current_source_dir() / 'include',
+                        native: false, language: 'objcpp')
+endif
 if host_os == 'linux'
   add_project_arguments('-isystem', meson.current_source_dir() / 'linux-headers',
                         '-isystem', 'linux-headers',
@@ -2453,19 +2475,10 @@ endif
 
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
-if host_os == 'darwin' and vulkan.found()
-  # The Metal presentation backend (ui/xui/metal-present.mm) is Objective-C++
-  # (.mm). The objcpp language is not part of the default project languages, so
-  # enable it for xemu's own targets. imgui_impl_metal.mm (pulled in via the imgui
-  # subproject below when metal=enabled) is written for ARC, and metal-present.mm
-  # is written to compile under ARC, so enable -fobjc-arc for objcpp translation
-  # units. Note add_global_arguments only reaches this (root) project's targets;
-  # the imgui subproject applies -fobjc-arc to its own .mm via the packagefiles
-  # patch (subprojects/packagefiles/imgui/meson.build). This only affects .mm
-  # files (the rest of xemu's Objective-C is .m / non-ARC and is left untouched).
-  add_languages('objcpp', native: false)
-  add_global_arguments('-fobjc-arc', language: 'objcpp')
-endif
+# objcpp language and -fobjc-arc for the Metal presentation backend are enabled
+# up-front with the other compiler flags (add_project_arguments must precede the
+# first build target). See the host_os == 'darwin' block near the top-level flag
+# setup.
 
 imgui_proj = subproject('imgui', required: true,
                          default_options: [
