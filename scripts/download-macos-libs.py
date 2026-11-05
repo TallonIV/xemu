@@ -189,12 +189,14 @@ def main():
 		'libpcap',
 		'libslirp',
 		'libusb',
-		# Vulkan loader + headers (pulls in vulkan-headers and MoltenVK via
-		# @pkgdep). Installs opt/local/lib/pkgconfig/vulkan.pc so that
-		# meson's dependency('vulkan') resolves on the pinned PKG_CONFIG_LIBDIR,
+		# Vulkan loader + headers. Installs opt/local/lib/pkgconfig/vulkan.pc so
+		# that meson's dependency('vulkan') resolves on the pinned PKG_CONFIG_LIBDIR,
 		# which in turn enables the NV2A Vulkan renderer and the Metal present
-		# backend on Apple Silicon.
-		'vulkan-loader'])
+		# backend on Apple Silicon. vulkan-headers ships the vulkan/*.h headers that
+		# volk and the renderer compile against; the loader does not declare it as a
+		# runtime @pkgdep, so it must be requested explicitly here.
+		'vulkan-loader',
+		'vulkan-headers'])
 
 if __name__ == '__main__':
 	main()
