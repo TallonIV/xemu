@@ -117,6 +117,12 @@ package_macos() {
     for dylib in "dist/xemu.app/Contents/Libraries/${target_arch}"/*.dylib; do
         if [ -e "${dylib}" ]; then
             dedupe_rpaths "${dylib}"
+            # dedupe_rpaths rewrites load commands via install_name_tool, which
+            # invalidates the ad-hoc signature. The trailing codesign --deep only
+            # covers the executable (not these non-standard Libraries/ dylibs),
+            # so re-sign each dylib now or macOS 26's code signing monitor kills
+            # the process when dyld maps it.
+            codesign --force --sign - "${dylib}"
         fi
     done
 
