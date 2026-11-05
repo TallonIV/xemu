@@ -275,7 +275,9 @@ bool xemu_metal_present_init(SDL_Window *window)
             return true;
         }
 
-        NSWindow *ns_window = (NSWindow *)SDL_GetPointerProperty(
+        // SDL owns the NSWindow lifetime; borrow it with a __bridge cast (no
+        // ARC ownership transfer).
+        NSWindow *ns_window = (__bridge NSWindow *)SDL_GetPointerProperty(
             SDL_GetWindowProperties(window),
             SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
         if (ns_window == nil) {
@@ -676,7 +678,7 @@ void xemu_metal_present_end_frame(bool vsync)
             const uint64_t fb_seq = g_metal.framebufferReadSeq;
             [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 (void)cb;
-                [fb_event setSignalValue:fb_seq];
+                [fb_event setSignaledValue:fb_seq];
             }];
 
             [cmdbuf commit];
@@ -840,8 +842,8 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         std::vector<uint8_t> packed((size_t)bytes_per_row * height);
         [target getBytes:packed.data()
              bytesPerRow:bytes_per_row
-                ofRegion:MTLRegionMake2D(0, 0, width, height)
-             mipmapLevel:0];
+           textureRange:MTLRegionMake2D(0, 0, width, height)
+            mipmapLevel:0];
 
         rgba.resize((size_t)width * height * 4);
         for (int y = 0; y < height; y++) {
