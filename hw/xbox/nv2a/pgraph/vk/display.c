@@ -20,6 +20,10 @@
 #include "renderer.h"
 #include <math.h>
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+#include <objc/runtime.h>
+#endif
+
 #include "hw/xbox/nv2a/debug_gl.h"
 
 static uint8_t *convert_texture_data__CR8YB8CB8YA8(uint8_t *data_out,
@@ -544,9 +548,16 @@ static void destroy_current_display_image(PGRAPHState *pg)
     destroy_frame_buffer(pg);
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* The MTLTexture is owned by the VkImage and released when the image is
-     * destroyed below; just drop our reference. */
-    d->mtl_texture = NULL;
+    /* vkExportMetalObjectsEXT() returns the MTLTexture with a +1 retain count
+     * that belongs to us (see VK_EXT_metal_objects "Safe-Returned Objects"),
+     * so we took ownership in create_display_image(). Release it before the
+     * backing VkImage (and its underlying MTLTexture) is destroyed below. The
+     * Metal presenter drains in-flight GPU work before the renderer is
+     * finalized, so no command buffer can still reference it here. */
+    if (d->mtl_texture) {
+        objc_release(d->mtl_texture);
+        d->mtl_texture = NULL;
+    }
 #elif HAVE_EXTERNAL_MEMORY
     glDeleteTextures(1, &d->gl_texture_id);
     d->gl_texture_id = 0;
@@ -703,6 +714,11 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .pNext = &metal_texture_info,
     };
     vkExportMetalObjectsEXT(r->device, &metal_objects_info);
+
+    /* Safe-returned object: mtlTexture arrives with +1 and we own it. Keep that
+     * reference (balanced by objc_release() in destroy_current_display_image())
+     * so the texture stays alive for the Metal presenter even if the backing
+     * VkImage is recreated (e.g. a guest resolution change) mid-frame. */
     d->mtl_texture = metal_texture_info.mtlTexture;
     assert(d->mtl_texture);
     d->gl_texture_id = 0;

@@ -382,7 +382,24 @@ void xemu_hud_render()
     }
 
     if (g_screenshot_pending) {
+#if defined(__APPLE__) && defined(CONFIG_VULKAN)
+        if (xemu_metal_present_is_active()) {
+            // Metal path: the framebuffer lives in an exported MTLTexture (not a
+            // GL texture), so capture it into RGBA and encode. g_tex is only
+            // valid on the GL path. A failed capture means there was nothing to
+            // grab (e.g. the screen is blanked), so it is silently skipped.
+            std::vector<uint8_t> rgba;
+            int w = 0, h = 0;
+            if (xemu_metal_capture_framebuffer_rgba(g_metal_framebuffer_texture,
+                                                     false, rgba, &w, &h)) {
+                SaveScreenshotFromRGBA(rgba, w, h);
+            }
+        } else {
+            SaveScreenshot(g_tex, g_flip_req);
+        }
+#else
         SaveScreenshot(g_tex, g_flip_req);
+#endif
         g_screenshot_pending = false;
     }
 }

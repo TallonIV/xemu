@@ -72,8 +72,31 @@ void xemu_metal_imgui_recreate_font_texture(void);
 /* Returns the id<MTLDevice> (as void*) in use by the presenter, or NULL. */
 void *xemu_metal_present_device(void);
 
+// The framebuffer MTLTexture (as void*) sampled during the current UI frame.
+// Owned by the Metal render loop (ui/xemu.c); valid while the framebuffer
+// surface is held between nv2a_get_framebuffer_mtl_texture() and its release.
+// Mirrors the static g_tex/g_flip_req used by the OpenGL presentation path.
+#if defined(CONFIG_VULKAN)
+extern void *g_metal_framebuffer_texture;
+#endif
+
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+#include <cstdint>
+#include <vector>
+
+/* Encode an offscreen copy of the emulator framebuffer (an id<MTLTexture>
+ * passed as void*, as returned by nv2a_get_framebuffer_mtl_texture()) into
+ * tightly packed RGBA8 pixels, mirroring the aspect-correction and flip
+ * semantics of the GL screenshot path. Returns false if capture is
+ * unavailable (e.g. the screen is blanked). The caller must hold a +1
+ * reference on the texture for the duration of this call. */
+bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture, bool flip,
+                                         std::vector<uint8_t> &rgba,
+                                         int *out_width, int *out_height);
 #endif
 
 #endif /* __APPLE__ */

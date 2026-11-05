@@ -27,7 +27,8 @@ int nv2a_get_framebuffer_surface(void);
 void nv2a_release_framebuffer_surface(void);
 #ifdef __APPLE__
 /* Returns the current framebuffer as an id<MTLTexture> (as void*) for the
- * Metal presentation path, or NULL if unavailable. */
+ * Metal presentation path, or NULL if unavailable. The renderer retains a
+ * strong reference to the texture until nv2a_release_framebuffer_surface(). */
 void *nv2a_get_framebuffer_mtl_texture(void);
 /* Returns the id<MTLDevice> (as void*) backing the renderer, or NULL. */
 void *nv2a_get_mtl_device(void);

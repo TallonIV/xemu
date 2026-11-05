@@ -1459,12 +1459,31 @@ static void voice_process(MCPXAPUState *d,
         uint16_t hrtf_handle =
             voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                            NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
-        if (hrtf_handle != HRTF_NULL_HANDLE) {
+        if (hrtf_handle != HRTF_NULL_HANDLE && hrtf_handle < HRTF_ENTRY_COUNT) {
+            /* The voice references an HRTF entry by handle. Software updates
+             * that entry's HRIR coefficients/ITD as a sound's position changes
+             * without necessarily reassigning the voice's handle, so refresh
+             * the filter parameters from the current entry contents here. This
+             * lets the filter track live positional updates instead of keeping
+             * the values cached when the handle was first assigned.
+             */
+            hrtf_filter_set_target_params(&d->vp.filters[v].hrtf,
+                                          d->vp.hrtf.entries[hrtf_handle].hrir,
+                                          d->vp.hrtf.entries[hrtf_handle].itd);
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
         }
     }
 
     // FIXME: ParaEQ
+
+    /* A 3D voice is HRTF-filtered into a stereo (left/right ear) signal, so it
+     * exposes two output channels to the submix bins regardless of whether its
+     * sample source was mono or stereo. 2D voices route using their native
+     * channel count. Using the source `channels` here would collapse a mono 3D
+     * voice onto the left-ear output and discard the positional right-ear HRTF
+     * contribution.
+     */
+    int out_channels = (v < MCPX_HW_MAX_3D_VOICES) ? 2 : channels;
 
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
@@ -1477,7 +1496,7 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b])/hr;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g*samples[i][b % channels];
+            mixbins[bin[b]][i] += g*samples[i][b % out_channels];
         }
     }
 

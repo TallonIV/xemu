@@ -53,4 +53,10 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip);
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2]);
 bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width = 0, int max_height = 0);
 void SaveScreenshot(GLuint tex, bool flip);
+// Writes an already-encoded PNG buffer to a timestamped screenshot file and
+// queues the resulting notification/error. Shared by the GL and Metal paths.
+void SaveScreenshotFromPng(const std::vector<uint8_t> &png);
+// Encodes tightly-packed RGBA8 pixels (Metal capture path) and saves them.
+void SaveScreenshotFromRGBA(const std::vector<uint8_t> &rgba, int width,
+                            int height);
 void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height);

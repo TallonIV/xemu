@@ -1009,41 +1009,36 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     return fpng::fpng_encode_image_to_memory(pixels.data(), width, height, 3, png);
 }
 
-void SaveScreenshot(GLuint tex, bool flip)
+void SaveScreenshotFromPng(const std::vector<uint8_t> &png)
 {
     Error *err = NULL;
     char fname[128];
-    std::vector<uint8_t> png;
 
-    if (RenderFramebufferToPng(tex, flip, png)) {
-        time_t t = time(NULL);
-        struct tm *tmp = localtime(&t);
-        if (tmp) {
-            strftime(fname, sizeof(fname), "xemu-%Y-%m-%d-%H-%M-%S.png", tmp);
-        } else {
-            strcpy(fname, "xemu.png");
-        }
-
-        const char *output_dir = g_config.general.screenshot_dir;
-        if (!strlen(output_dir)) {
-            output_dir = ".";
-        }
-        // FIXME: Check for existing path
-        char *path = g_strdup_printf("%s/%s", output_dir, fname);
-        FILE *fd = qemu_fopen(path, "wb");
-        if (fd) {
-            int s = fwrite(png.data(), png.size(), 1, fd);
-            if (s != 1) {
-                error_setg(&err, "Failed to write %s", path);
-            }
-            fclose(fd);
-        } else {
-            error_setg(&err, "Failed to open %s for writing", path);
-        }
-        g_free(path);
+    time_t t = time(NULL);
+    struct tm *tmp = localtime(&t);
+    if (tmp) {
+        strftime(fname, sizeof(fname), "xemu-%Y-%m-%d-%H-%M-%S.png", tmp);
     } else {
-        error_setg(&err, "Failed to encode PNG image");
+        strcpy(fname, "xemu.png");
     }
+
+    const char *output_dir = g_config.general.screenshot_dir;
+    if (!strlen(output_dir)) {
+        output_dir = ".";
+    }
+    // FIXME: Check for existing path
+    char *path = g_strdup_printf("%s/%s", output_dir, fname);
+    FILE *fd = qemu_fopen(path, "wb");
+    if (fd) {
+        int s = fwrite(png.data(), png.size(), 1, fd);
+        if (s != 1) {
+            error_setg(&err, "Failed to write %s", path);
+        }
+        fclose(fd);
+    } else {
+        error_setg(&err, "Failed to open %s for writing", path);
+    }
+    g_free(path);
 
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
@@ -1052,5 +1047,36 @@ void SaveScreenshot(GLuint tex, bool flip)
         char *msg = g_strdup_printf("Screenshot Saved: %s", fname);
         xemu_queue_notification(msg);
         free(msg);
+    }
+}
+
+void SaveScreenshot(GLuint tex, bool flip)
+{
+    std::vector<uint8_t> png;
+
+    if (RenderFramebufferToPng(tex, flip, png)) {
+        SaveScreenshotFromPng(png);
+    } else {
+        Error *err = NULL;
+        error_setg(&err, "Failed to encode PNG image");
+        xemu_queue_error_message(error_get_pretty(err));
+        error_report_err(err);
+    }
+}
+
+void SaveScreenshotFromRGBA(const std::vector<uint8_t> &rgba, int width,
+                            int height)
+{
+    // Used by the Metal presentation path, where the framebuffer is captured
+    // into tightly-packed RGBA8 rather than read back through GL.
+    std::vector<uint8_t> png;
+    Error *err = NULL;
+
+    if (fpng::fpng_encode_image_to_memory(rgba.data(), width, height, 4, png)) {
+        SaveScreenshotFromPng(png);
+    } else {
+        error_setg(&err, "Failed to encode PNG image");
+        xemu_queue_error_message(error_get_pretty(err));
+        error_report_err(err);
     }
 }

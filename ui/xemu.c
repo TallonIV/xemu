@@ -67,6 +67,13 @@
 
 #ifdef __APPLE__
 #include "xui/metal-present.h"
+
+#if defined(CONFIG_VULKAN)
+// The framebuffer MTLTexture sampled during the current Metal UI frame; kept
+// live for the frame by the presenter. Consumed by the screenshot path in
+// xui/main.cc (declared in xui/metal-present.h).
+void *g_metal_framebuffer_texture;
+#endif
 #endif
 
 #ifndef DEBUG_XEMU_C
@@ -841,11 +848,15 @@ static void gl_render_frame(struct xemu_console *scon)
         // Native Metal path: composite the HUD on top of the Vulkan renderer's
         // exported MTLTexture, then present the CAMetalLayer drawable.
         //
-        // begin_frame() first so it can wait for the previous frame's Metal
-        // sampling to finish before the renderer overwrites the shared texture.
+        // begin_frame() first: it waits (on a GPU-signaled MTLSharedEvent) for
+        // the previous frame's framebuffer *sample* to finish, so it is safe for
+        // the renderer to overwrite the shared texture below. Waiting only on the
+        // sample - not the whole presented frame - lets the prior HUD/present
+        // overlap with this frame's rendering.
         xemu_metal_present_begin_frame();
 
         void *mtl_texture = nv2a_get_framebuffer_mtl_texture();
+        g_metal_framebuffer_texture = mtl_texture;
         xemu_metal_present_blit_framebuffer(mtl_texture, false);
 
         xemu_main_loop_lock();
@@ -855,6 +866,7 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_hud_render();
         xemu_metal_present_end_frame(g_config.display.window.vsync);
 
+        g_metal_framebuffer_texture = NULL;
         nv2a_release_framebuffer_surface();
         qatomic_set(&rendering, false);
         return;

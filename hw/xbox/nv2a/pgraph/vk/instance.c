@@ -22,6 +22,10 @@
 #include "renderer.h"
 #include "xemu-version.h"
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+#include <objc/runtime.h>
+#endif
+
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
 
@@ -345,12 +349,6 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-
-#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    r->external_memory_metal_extension_enabled = add_extension_if_available(
-        available_extensions, enabled_extension_names,
-        VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME);
-#endif
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -646,20 +644,22 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         .pNext = &metal_device_info,
     };
     vkExportMetalObjectsEXT(r->device, &metal_objects_info);
-    r->mtl_device = metal_device_info.mtlDevice;
 
     /* Feasibility gate result (macOS Metal present path). VK_EXT_metal_objects
      * is a required device extension, so reaching this point means it is
      * present; image MTLTexture export is validated later in the display path. */
-    fprintf(stderr,
-            "Metal interop gate: VK_EXT_metal_objects=required+enabled, "
-            "VK_EXT_external_memory_metal=%s, MTLDevice export=%s\n",
-            r->external_memory_metal_extension_enabled ? "present" : "absent",
-            r->mtl_device ? "ok" : "failed");
-    if (!r->mtl_device) {
+    if (!metal_device_info.mtlDevice) {
         error_setg(errp, "Failed to export MTLDevice via VK_EXT_metal_objects");
         return false;
     }
+
+    /* Safe-returned object: the device arrives with a +1 retain count owned by
+     * us. This file is compiled in non-ARC C mode, so the pointer already has
+     * exactly the +1 we need - store it directly (no objc_retain) and balance
+     * it with a single objc_release() in pgraph_vk_finalize_instance(). */
+    r->mtl_device = metal_device_info.mtlDevice;
+    fprintf(stderr, "Metal interop gate: VK_EXT_metal_objects=required+enabled, "
+                    "MTLDevice export=ok\n");
 #endif
 
     return true;
@@ -742,6 +742,15 @@ void pgraph_vk_finalize_instance(PGRAPHState *pg)
     }
 
     if (r->device != VK_NULL_HANDLE) {
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+        /* Balance the +1 reference taken on the exported MTLDevice. The Metal
+         * presenter has already drained its queue by this point (renderer
+         * finalize runs after UI teardown). */
+        if (r->mtl_device) {
+            objc_release(r->mtl_device);
+            r->mtl_device = NULL;
+        }
+#endif
         vkDestroyDevice(r->device, NULL);
         r->device = VK_NULL_HANDLE;
     }

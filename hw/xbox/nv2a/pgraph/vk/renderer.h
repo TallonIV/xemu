@@ -334,7 +334,8 @@ typedef struct PGRAPHVkState {
     bool memory_budget_extension_enabled;
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    bool external_memory_metal_extension_enabled;
+    // Metal Interop (VK_EXT_metal_objects). Retained reference to the
+    // safe-returned device (see create_logical_device()).
     MTLDevice_id mtl_device;
 #endif
 

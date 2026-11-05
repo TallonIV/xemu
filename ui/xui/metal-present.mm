@@ -130,6 +130,10 @@ static const BlitVertIn kQuadVerts[4] = {
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @property (nonatomic, strong) CAMetalLayer *layer;
 @property (nonatomic, strong) id<MTLRenderPipelineState> gammaPipeline;
+// Passthrough variant used by the screenshot capture path. The source
+// framebuffer is sampled either way, so this pipeline must use the same
+// color attachment format as the capture target (BGRA8Unorm).
+@property (nonatomic, strong) id<MTLRenderPipelineState> passthroughPipeline;
 @property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
 @property (nonatomic, strong) id<MTLBuffer> paletteBuffer;
@@ -146,9 +150,38 @@ static const BlitVertIn kQuadVerts[4] = {
 @property (nonatomic, strong) id<MTLRenderCommandEncoder> encoder;
 @property (nonatomic, assign) CGSize drawableSize;
 
-// The command buffer that sampled the framebuffer during the previous frame.
-// We wait for it to complete before letting the Vulkan renderer overwrite the
-// shared MTLTexture (the Metal analog of the GL path's glFinish()).
+// Strong reference to the Vulkan renderer's exported framebuffer texture for
+// the duration of the current UI frame. Without this, a guest resolution
+// change on the render thread could destroy the backing VkImage (and release
+// its MTLTexture) while our command buffer still samples it.
+@property (nonatomic, strong) id<MTLTexture> framebufferTexture;
+
+// Reverse-direction synchronization (Metal-read -> Vulkan-write). The shared
+// framebuffer MTLTexture is written by the Vulkan renderer and read by our
+// gamma blit. The next frame must not let Vulkan overwrite it until this
+// frame's blit has finished reading it.
+//
+// We signal framebufferReadEvent on the GPU immediately after the blit draw
+// (NOT after the HUD compositing / presentation), so the next frame's Vulkan
+// render kickoff only waits for that read - letting the current frame's HUD
+// and present overlap with the next frame's Vulkan rendering. This replaces a
+// full waitUntilCompleted on the whole command buffer, which serialized all
+// GPU work behind the CPU frame loop.
+//
+// framebufferReadSeq is the value encoded by the most recent blit's signal;
+// framebufferReadWaited is the last value the CPU blocked on (so we never wait
+// twice for the same frame, and skip the wait when a frame encoded no blit).
+//
+// TODO(PR4-followup): drive framebufferReadSeq into Vulkan (MTLSharedEvent
+// imported via VK_EXT_metal_external_semaphore) so the wait moves fully onto
+// the GPU and off the CPU timeline once the KosmicKrisp gate confirms support.
+@property (nonatomic, strong) id<MTLSharedEvent> framebufferReadEvent;
+@property (nonatomic, assign) uint64_t framebufferReadSeq;
+@property (nonatomic, assign) uint64_t framebufferReadWaited;
+
+// The command buffer of the most recently presented frame. Retained only so
+// cleanup() can drain in-flight GPU work before our Metal objects (and the
+// borrowed framebuffer texture reference) are released.
 @property (nonatomic, strong) id<MTLCommandBuffer> lastCommandBuffer;
 @end
 
@@ -293,6 +326,14 @@ bool xemu_metal_present_init(SDL_Window *window)
             return false;
         }
 
+        p.passthroughPipeline = BuildPipeline(device,
+                                              [NSString stringWithUTF8String:kBlitMSLSource],
+                                              @"blit_passthrough", &error);
+        if (p.passthroughPipeline == nil) {
+            fprintf(stderr, "xemu_metal_present_init: passthrough pipeline creation failed\n");
+            return false;
+        }
+
         p.vertexBuffer = [device newBufferWithBytes:kQuadVerts
                                              length:sizeof(kQuadVerts)
                                             options:MTLResourceOptionCPUCacheModeDefault];
@@ -311,6 +352,10 @@ bool xemu_metal_present_init(SDL_Window *window)
                                      mipmapped:NO];
         dummy_desc.usage = MTLTextureUsageShaderRead;
         p.dummyTexture = [device newTextureWithDescriptor:dummy_desc];
+
+        // GPU-signaled event used for the Metal-read -> Vulkan-write reverse
+        // dependency (see the framebufferReadEvent property comment).
+        p.framebufferReadEvent = [device newSharedEvent];
 
         g_metal = p;
         g_metal_window = window;
@@ -344,6 +389,7 @@ void xemu_metal_present_cleanup(void)
         }
 
         g_metal.drawable = nil;
+        g_metal.framebufferTexture = nil;
         g_metal = nil;
         g_metal_active = false;
         g_metal_window = nil;
@@ -390,15 +436,29 @@ void xemu_metal_present_begin_frame(void)
         assert(g_metal_active);
 
         // Reverse-direction synchronization: ensure the previous frame's Metal
-        // sampling of the shared MTLTexture has finished before the caller
-        // lets the Vulkan renderer overwrite it. This is called before
-        // nv2a_get_framebuffer_mtl_texture() in the render loop.
-        // TODO(PR4-followup): replace the CPU-side waitUntilCompleted with a
-        // MTLSharedEvent (VK_EXT_external_semaphore_metal) once the KosmicKrisp
-        // gate confirms support, to restore CPU/GPU overlap.
-        if (g_metal.lastCommandBuffer != nil) {
-            [g_metal.lastCommandBuffer waitUntilCompleted];
-            g_metal.lastCommandBuffer = nil;
+        // blit has finished SAMPLING the shared framebuffer MTLTexture before
+        // the caller lets the Vulkan renderer overwrite it (get_framebuffer ->
+        // pgraph sync). We wait on the GPU-signaled event value rather than the
+        // whole command buffer, so the previous frame's HUD compositing and
+        // presentation overlap with this frame's Vulkan rendering. This is the
+        // CPU/GPU-overlap analog of removing a glFinish() in the GL path.
+        //
+        // get_framebuffer() is only called after this returns, and the event is
+        // signaled during the prior frame's blit (early in that frame), so in
+        // the steady state this wait is already satisfied and returns at once.
+        // The generous timeout is only a hang-safety valve (it must never
+        // trigger); if it does we log and proceed rather than wedge the UI
+        // thread, at the cost of at most a single-frame glitch.
+        if (g_metal.framebufferReadSeq > g_metal.framebufferReadWaited) {
+            BOOL signaled = [g_metal.framebufferReadEvent
+                waitUntilSignaledValue:g_metal.framebufferReadSeq
+                             timeoutMS:1000];
+            if (!signaled) {
+                fprintf(stderr, "xemu_metal_present_begin_frame: framebuffer "
+                                "read event stalled (seq=%llu)\n",
+                        (unsigned long long)g_metal.framebufferReadSeq);
+            }
+            g_metal.framebufferReadWaited = g_metal.framebufferReadSeq;
         }
 
         if (g_pending_resize) {
@@ -433,11 +493,17 @@ void xemu_metal_present_begin_frame(void)
 void xemu_metal_present_blit_framebuffer(void *mtl_texture_void, bool flip)
 {
     @autoreleasepool {
+        // Take a strong reference for the duration of the frame as soon as the
+        // texture is handed over, even if we bail out below. This keeps the
+        // MTLTexture alive if the render thread recreates the display image
+        // (e.g. a guest resolution change) before our commands execute.
+        g_metal.framebufferTexture = mtl_texture_void ? (__bridge id<MTLTexture>)mtl_texture_void : nil;
+
         if (!g_metal_active || g_metal.encoder == nil || g_metal.drawable == nil) {
             return;
         }
 
-        id<MTLTexture> texture = (__bridge id<MTLTexture>)mtl_texture_void;
+        id<MTLTexture> texture = g_metal.framebufferTexture;
         if (texture == nil) {
             return;
         }
@@ -525,6 +591,15 @@ void xemu_metal_present_blit_framebuffer(void *mtl_texture_void, bool flip)
         [enc drawPrimitives:MTLPrimitiveTypeTriangleFan
                 vertexStart:0
                 vertexCount:4];
+
+        // Signal once the GPU has finished sampling the framebuffer for THIS
+        // blit. It is encoded before the HUD draw commands (added later by
+        // xemu_metal_imgui_render_draw_data into this same encoder), so the
+        // next frame's begin_frame wait is satisfied as soon as the blit read
+        // completes - the HUD and present are not on the critical path.
+        g_metal.framebufferReadSeq++;
+        [enc encodeSignalEvent:g_metal.framebufferReadEvent
+                       atValue:g_metal.framebufferReadSeq];
     }
 }
 
@@ -556,13 +631,141 @@ void xemu_metal_present_end_frame(bool vsync)
             [drawable present];
             [cmdbuf commit];
 
-            // Track this command buffer so the next begin_frame() waits until
-            // Metal is done sampling the shared framebuffer texture.
+            // Retain for the teardown drain in cleanup() only. Per-frame
+            // framebuffer ordering is handled by framebufferReadEvent.
             g_metal.lastCommandBuffer = cmdbuf;
         }
 
+        // The committed command buffer keeps its own references to textures
+        // used by encoded commands, so our frame reference can go now.
+        g_metal.framebufferTexture = nil;
         g_metal.drawable = nil;
         g_metal.commandBuffer = nil;
+    }
+}
+
+//
+// Screenshot capture.
+//
+
+bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
+                                         std::vector<uint8_t> &rgba,
+                                         int *out_width, int *out_height)
+{
+    @autoreleasepool {
+        if (!g_metal_active) {
+            return false;
+        }
+
+        id<MTLTexture> texture = (__bridge id<MTLTexture>)mtl_texture_void;
+        if (texture == nil || nv2a_get_screen_off()) {
+            // Nothing to capture (no framebuffer, or the screen is blanked).
+            return false;
+        }
+
+        // Mirror the GL screenshot path (RenderFramebufferToPng): correct the
+        // width to the display aspect ratio, then render 1:1 into an offscreen
+        // target. The GL path reads back bottom-up and flips via !flip on
+        // render; a fresh Metal texture read by getBytes() is top-down, so the
+        // same !flip normalization applies directly.
+        int width = (int)texture.height * XemuMetalDisplayAspectRatio((int)texture.width,
+                                                                      (int)texture.height);
+        int height = (int)texture.height;
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+
+        id<MTLTexture> target = nil;
+        {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                             width:width
+                                            height:height
+                                         mipmapped:NO];
+            desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            target = [g_metal.device newTextureWithDescriptor:desc];
+        }
+        if (target == nil) {
+            return false;
+        }
+
+        BlitUniforms u;
+        memset(&u, 0, sizeof(u));
+        u.scaleOffset[0] = 1.0f;
+        u.scaleOffset[1] = 1.0f;
+        u.texScaleOffset[0] = 1.0f;
+        u.texScaleOffset[1] = 1.0f;
+        u.flip = !flip;
+
+        id<MTLBuffer> uniform = [g_metal.device
+            newBufferWithBytes:&u
+                        length:sizeof(u)
+                       options:MTLResourceOptionCPUCacheModeDefault];
+
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = target;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLCommandBuffer> cmdbuf = [g_metal.queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc =
+            [cmdbuf renderCommandEncoderWithDescriptor:pass];
+        if (enc == nil || uniform == nil) {
+            return false;
+        }
+
+        [enc setRenderPipelineState:g_metal.passthroughPipeline];
+        [enc setVertexBuffer:g_metal.vertexBuffer offset:0 atIndex:0];
+        [enc setVertexBuffer:uniform offset:0 atIndex:1];
+        [enc setFragmentTexture:texture atIndex:0];
+        [enc setFragmentSamplerState:g_metal.samplerLinear atIndex:0];
+
+        MTLViewport viewport;
+        viewport.originX = 0.0;
+        viewport.originY = 0.0;
+        viewport.width = (double)width;
+        viewport.height = (double)height;
+        viewport.zNear = 0.0;
+        viewport.zFar = 1.0;
+        [enc setViewport:viewport];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleFan
+                vertexStart:0
+                vertexCount:4];
+        [enc endEncoding];
+
+        [cmdbuf commit];
+        [cmdbuf waitUntilCompleted];
+
+        // Copy out row by row (getBytes honors bytesPerRow padding), converting
+        // the BGRA target to the tightly packed RGBA that the PNG encoder wants.
+        const int bytes_per_row = (int)target.bytesPerRow;
+        std::vector<uint8_t> packed((size_t)bytes_per_row * height);
+        if (![target getBytes:&packed[0]
+                   bytesPerRow:bytes_per_row
+                     ofRegion:MTLRegionMake2D(0, 0, width, height)
+                        mipmapLevel:0]) {
+            return false;
+        }
+
+        rgba.resize((size_t)width * height * 4);
+        for (int y = 0; y < height; y++) {
+            const uint8_t *src = &packed[(size_t)y * bytes_per_row];
+            uint8_t *dst = &rgba[(size_t)y * width * 4];
+            for (int x = 0; x < width; x++) {
+                dst[x * 4 + 0] = src[x * 4 + 2]; // R
+                dst[x * 4 + 1] = src[x * 4 + 1]; // G
+                dst[x * 4 + 2] = src[x * 4 + 0]; // B
+                dst[x * 4 + 3] = 255;            // RGBA8 output is opaque
+            }
+        }
+
+        if (out_width) {
+            *out_width = width;
+        }
+        if (out_height) {
+            *out_height = height;
+        }
+        return true;
     }
 }
 
