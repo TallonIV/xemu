@@ -7,6 +7,13 @@ on:
         description: Build version
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (commit, branch, or tag) to build
+        required: true
+        type: string
+        default: master
 
 jobs:
   build:

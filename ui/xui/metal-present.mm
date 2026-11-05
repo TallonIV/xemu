@@ -840,10 +840,18 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         // row (width * 4) and read through it manually.
         const NSUInteger bytes_per_row = (NSUInteger)width * 4;
         std::vector<uint8_t> packed((size_t)bytes_per_row * height);
+        // MTLTexture's only portable readback entry point is the 6-argument
+        // getBytes:bytesPerRow:bytesPerImage:ofRegion:mipLevel:slice: (the 4-
+        // argument ofRegion:/textureRange: conveniences are not declared in this
+        // SDK). For a single-slice 2D texture bytesPerImage is a full-plane row
+        // stride and slice is 0.
+        const NSUInteger bytes_per_image = bytes_per_row * (NSUInteger)height;
         [target getBytes:packed.data()
              bytesPerRow:bytes_per_row
-           textureRange:MTLRegionMake2D(0, 0, width, height)
-            mipmapLevel:0];
+           bytesPerImage:bytes_per_image
+                ofRegion:MTLRegionMake2D(0, 0, width, height)
+                mipLevel:0
+                   slice:0];
 
         rgba.resize((size_t)width * height * 4);
         for (int y = 0; y < height; y++) {
