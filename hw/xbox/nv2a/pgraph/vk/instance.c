@@ -24,6 +24,7 @@
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
 #include <objc/runtime.h>
+#include <SDL3/SDL.h>
 #endif
 
 #define VkExtensionPropertiesArray GArray
@@ -167,11 +168,41 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* On macOS, locate and load the Vulkan loader through SDL3, which probes
+     * the system, framework and Homebrew locations and honors loader discovery
+     * env vars. volkInitialize()'s default path only dlopens the bare soname
+     * "libvulkan.1.dylib", which a Finder/launchd-launched .app cannot resolve
+     * when the loader is intentionally left unbundled (see the macOS Vulkan
+     * driver delivery model). SDL's vkGetInstanceProcAddr is then handed to
+     * volk via volkInitializeCustom. */
+    if (SDL_Vulkan_LoadLibrary(NULL) != 0) {
+        error_setg(errp, "SDL_Vulkan_LoadLibrary failed: %s", SDL_GetError());
+        return false;
+    }
+
+    PFN_vkGetInstanceProcAddr get_proc_addr =
+        (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!get_proc_addr) {
+        error_setg(errp, "SDL_Vulkan_GetVkGetInstanceProcAddr failed: %s",
+                   SDL_GetError());
+        SDL_Vulkan_UnloadLibrary();
+        return false;
+    }
+
+    result = volkInitializeCustom(get_proc_addr);
+    if (result != VK_SUCCESS) {
+        error_setg(errp, "volkInitializeCustom failed");
+        SDL_Vulkan_UnloadLibrary();
+        return false;
+    }
+#else
     result = volkInitialize();
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;
     }
+#endif
 
     uint32_t instance_version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) {
@@ -766,4 +797,10 @@ void pgraph_vk_finalize_instance(PGRAPHState *pg)
     }
 
     volkFinalize();
+
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    /* Balance the loader reference taken by SDL_Vulkan_LoadLibrary() in
+     * create_instance(). Safe even if the library was never loaded. */
+    SDL_Vulkan_UnloadLibrary();
+#endif
 }
