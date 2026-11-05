@@ -43,6 +43,14 @@
 
 #define HAVE_EXTERNAL_MEMORY 1
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT) && !defined(__OBJC__)
+/* The ARC runtime entry points are only declared by <objc/runtime.h> when
+ * compiling Objective-C (__OBJC__). This renderer is built as plain C, so
+ * declare the one helper we call directly. VK_EXT_metal_objects safe-returned
+ * objects arrive already +1 retained, so only objc_release() is needed here. */
+extern void objc_release(void *object);
+#endif
+
 typedef struct QueueFamilyIndices {
     int queue_family;
 } QueueFamilyIndices;
