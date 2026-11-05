@@ -21,6 +21,7 @@
 #ifdef __APPLE__
 
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -239,7 +240,7 @@ static id<MTLRenderPipelineState> BuildPipeline(id<MTLDevice> device,
     return [device newRenderPipelineStateWithDescriptor:desc error:error];
 }
 
-static id<MTLSamplerState> MakeSampler(id<MTLDevice> device, MTLSamplerFilter filter)
+static id<MTLSamplerState> MakeSampler(id<MTLDevice> device, MTLSamplerMinMagFilter filter)
 {
     MTLSamplerDescriptor *s = [[MTLSamplerDescriptor alloc] init];
     s.minFilter = filter;
@@ -274,9 +275,17 @@ bool xemu_metal_present_init(SDL_Window *window)
             return true;
         }
 
-        NSView *view = (NSView *)SDL_GetPointerProperty(
+        NSWindow *ns_window = (NSWindow *)SDL_GetPointerProperty(
             SDL_GetWindowProperties(window),
-            SDL_PROP_WINDOW_COCOA_VIEW_POINTER, nullptr);
+            SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+        if (ns_window == nil) {
+            fprintf(stderr, "xemu_metal_present_init: failed to get NSWindow\n");
+            return false;
+        }
+
+        // SDL3 only exposes the NSWindow (there is no COCOA_VIEW property); the
+        // CAMetalLayer is hosted by the window's content view.
+        NSView *view = [ns_window contentView];
         if (view == nil) {
             fprintf(stderr, "xemu_metal_present_init: failed to get NSView\n");
             return false;
@@ -303,7 +312,7 @@ bool xemu_metal_present_init(SDL_Window *window)
         layer.device = device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = YES;
-        layer.contentsScale = view.window.backingScaleFactor;
+        layer.contentsScale = ns_window.backingScaleFactor;
         // Synchronize presentation with CoreAnimation transactions so window
         // moves, live-resizes, and fullscreen transitions don't tear or show
         // garbage pixels. SDL3's own Metal view uses YES here; matches the
@@ -340,8 +349,8 @@ bool xemu_metal_present_init(SDL_Window *window)
                                               options:MTLResourceOptionCPUCacheModeDefault];
         p.paletteBuffer = [device newBufferWithLength:sizeof(uint32_t) * 256
                                               options:MTLResourceOptionCPUCacheModeDefault];
-        p.samplerLinear = MakeSampler(device, MTLSamplerFilterLinear);
-        p.samplerNearest = MakeSampler(device, MTLSamplerFilterNearest);
+        p.samplerLinear = MakeSampler(device, MTLSamplerMinMagFilterLinear);
+        p.samplerNearest = MakeSampler(device, MTLSamplerMinMagFilterNearest);
 
         // 1x1 placeholder used to neutralize not-yet-ported GL-overlay textures.
         // Explicitly initialized to transparent black (0,0,0,0) so that any HUD
@@ -610,21 +619,22 @@ void xemu_metal_present_blit_framebuffer(void *mtl_texture_void, bool flip)
         viewport.originY = 0.0;
         viewport.width = (double)dw;
         viewport.height = (double)dh;
-        viewport.zNear = 0.0;
-        viewport.zFar = 1.0;
+        viewport.znear = 0.0;
+        viewport.zfar = 1.0;
         [enc setViewport:viewport];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleFan
+        // Metal has no triangle-fan primitive; the BL,TL,TR,BR quad above is
+        // equivalent as a two-triangle strip (cull mode is left at its default
+        // None, so winding does not affect coverage).
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
                 vertexStart:0
                 vertexCount:4];
 
-        // Signal once the GPU has finished sampling the framebuffer for THIS
-        // blit. It is encoded before the HUD draw commands (added later by
-        // xemu_metal_imgui_render_draw_data into this same encoder), so the
-        // next frame's begin_frame wait is satisfied as soon as the blit read
-        // completes - the HUD and present are not on the critical path.
+        // Record the sequence value this frame's blit will publish. Signalling
+        // framebufferReadEvent is done from the command buffer's completion
+        // handler in end_frame: MTLRenderCommandEncoder has no
+        // encodeSignalEvent:atValue: (only compute/blit encoders do), so it
+        // cannot be emitted inline here.
         g_metal.framebufferReadSeq++;
-        [enc encodeSignalEvent:g_metal.framebufferReadEvent
-                       atValue:g_metal.framebufferReadSeq];
     }
 }
 
@@ -654,6 +664,21 @@ void xemu_metal_present_end_frame(bool vsync)
 #pragma clang diagnostic pop
 
             [drawable present];
+
+            // Publish the framebuffer-read sequence once this frame's GPU work
+            // has completed. MTLRenderCommandEncoder cannot encode an event
+            // signal, so the reverse Vulkan-write sync is driven from the command
+            // buffer completion handler. This waits on full frame completion
+            // rather than just the blit read (slightly less overlap than the
+            // intended design); revisit via VK_EXT_metal_external_semaphore once
+            // target hardware can validate it (see framebufferReadEvent note).
+            id<MTLSharedEvent> fb_event = g_metal.framebufferReadEvent;
+            const uint64_t fb_seq = g_metal.framebufferReadSeq;
+            [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                (void)cb;
+                [fb_event setSignalValue:fb_seq];
+            }];
+
             [cmdbuf commit];
 
             // Retain for the teardown drain in cleanup() only. Per-frame
@@ -795,10 +820,11 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         viewport.originY = 0.0;
         viewport.width = (double)width;
         viewport.height = (double)height;
-        viewport.zNear = 0.0;
-        viewport.zFar = 1.0;
+        viewport.znear = 0.0;
+        viewport.zfar = 1.0;
         [enc setViewport:viewport];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleFan
+        // Metal has no triangle-fan primitive; see the presenter path above.
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
                 vertexStart:0
                 vertexCount:4];
         [enc endEncoding];
@@ -806,16 +832,16 @@ bool xemu_metal_capture_framebuffer_rgba(void *mtl_texture_void, bool flip,
         [cmdbuf commit];
         [cmdbuf waitUntilCompleted];
 
-        // Copy out row by row (getBytes honors bytesPerRow padding), converting
-        // the BGRA target to the tightly packed RGBA that the PNG encoder wants.
-        const int bytes_per_row = (int)target.bytesPerRow;
+        // Copy out row by row, converting the BGRA target to the tightly packed
+        // RGBA that the PNG encoder wants. MTLTexture exposes no bytesPerRow
+        // property and getBytes returns void, so request a tightly packed BGRA8
+        // row (width * 4) and read through it manually.
+        const NSUInteger bytes_per_row = (NSUInteger)width * 4;
         std::vector<uint8_t> packed((size_t)bytes_per_row * height);
-        if (![target getBytes:&packed[0]
-                   bytesPerRow:bytes_per_row
-                     ofRegion:MTLRegionMake2D(0, 0, width, height)
-                        mipmapLevel:0]) {
-            return false;
-        }
+        [target getBytes:packed.data()
+             bytesPerRow:bytes_per_row
+                ofRegion:MTLRegionMake2D(0, 0, width, height)
+             mipmapLevel:0];
 
         rgba.resize((size_t)width * height * 4);
         for (int y = 0; y < height; y++) {
