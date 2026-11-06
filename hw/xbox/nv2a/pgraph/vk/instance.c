@@ -421,25 +421,38 @@ static bool check_device_support_required_extensions(VkPhysicalDevice device)
  * MTLTexture via VK_EXT_external_memory_metal. This is the mechanism the Metal
  * presenter uses to sample the Vulkan-rendered image, so a device that
  * advertises the extension but not the MTLTEXTURE export handle type must be
- * rejected here rather than failing later at display image creation. These
- * entry points are core in Vulkan 1.1+, which is already required above. */
+ * rejected here rather than failing later at display image creation. The
+ * dedicated vkGetPhysicalDeviceExternalImageFormatProperties() entry point is
+ * not exported by all volk builds, so we query the same information through
+ * vkGetPhysicalDeviceImageFormatProperties2() by chaining a
+ * VkPhysicalDeviceExternalImageFormatInfo (input) to a
+ * VkExternalImageFormatProperties (output). */
 static bool check_device_supports_metal_texture_export(VkPhysicalDevice device)
 {
     VkExternalImageFormatProperties external_properties = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+        .pNext = NULL,
     };
-
-    VkImageCreateInfo create_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
+    VkPhysicalDeviceExternalImageFormatInfo external_image_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+        .pNext = &external_properties,
+    };
+    VkImageFormatProperties2 format_properties = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        .pNext = &external_image_info,
+    };
+    VkPhysicalDeviceImageFormatInfo2 image_format_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
         .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .type = VK_IMAGE_TYPE_2D,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .flags = 0,
     };
 
-    VkResult result = vkGetPhysicalDeviceExternalImageFormatProperties(
-        device, &create_info, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-        &external_properties);
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties2(
+        device, &image_format_info, &format_properties);
 
     const VkExternalMemoryProperties *ext_mem =
         &external_properties.externalMemoryProperties;
