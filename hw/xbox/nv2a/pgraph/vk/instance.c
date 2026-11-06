@@ -417,17 +417,16 @@ static bool check_device_support_required_extensions(VkPhysicalDevice device)
 }
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-/* Verify the physical device can export the offscreen framebuffer as an
- * MTLTexture via VK_EXT_external_memory_metal. This is the mechanism the Metal
- * presenter uses to sample the Vulkan-rendered image, so a device that
- * advertises the extension but not the MTLTEXTURE export handle type must be
- * rejected here rather than failing later at display image creation. The
- * dedicated vkGetPhysicalDeviceExternalImageFormatProperties() entry point is
- * not exported by all volk builds, so we query the same information through
- * vkGetPhysicalDeviceImageFormatProperties2() by chaining a
- * VkPhysicalDeviceExternalImageFormatInfo (input) to a
- * VkExternalImageFormatProperties (output). */
-static bool check_device_supports_metal_texture_export(VkPhysicalDevice device)
+/* Best-effort diagnostic for the Metal present path. VK_EXT_external_memory_metal
+ * is already a *required* device extension (see required_device_extensions), so
+ * any device reaching here has advertised Metal memory export; the actual
+ * MTLTexture export is performed and validated in display.c. This query is
+ * informational only and MUST NOT reject the device: some drivers/loaders
+ * populate VkExternalImageFormatProperties only through the dedicated
+ * vkGetPhysicalDeviceExternalImageFormatProperties() entry point (which this
+ * volk build does not export), so the vkGetPhysicalDeviceImageFormatProperties2()
+ * chain can report nothing even when export works fine. */
+static void report_metal_texture_export_support(VkPhysicalDevice device)
 {
     VkExternalImageFormatProperties external_properties = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -456,18 +455,14 @@ static bool check_device_supports_metal_texture_export(VkPhysicalDevice device)
 
     const VkExternalMemoryProperties *ext_mem =
         &external_properties.externalMemoryProperties;
-    if (result != VK_SUCCESS ||
-        !(ext_mem->compatibleHandleTypes &
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) ||
-        !(ext_mem->externalMemoryFeatures &
-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
-        fprintf(stderr,
-                "device does not support VK_EXT_external_memory_metal "
-                "MTLTEXTURE export for the framebuffer\n");
-        return false;
-    }
+    bool confirmable = result == VK_SUCCESS &&
+        (ext_mem->compatibleHandleTypes &
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) &&
+        (ext_mem->externalMemoryFeatures &
+         VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
 
-    return true;
+    fprintf(stderr, "[vk] VK_EXT_external_memory_metal MTLTEXTURE export: %s\n",
+            confirmable ? "confirmed" : "not confirmable via query (proceeding)");
 }
 #endif
 
@@ -543,9 +538,6 @@ static bool is_device_compatible(VkPhysicalDevice device)
 
     return is_queue_family_indicies_complete(indices) &&
            check_device_support_required_extensions(device) &&
-#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-           check_device_supports_metal_texture_export(device) &&
-#endif
            check_device_support_required_formats(device);
     // FIXME: Check vram
 }
@@ -743,6 +735,9 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
      * exported MTLTexture handle (VK_EXT_external_memory_metal, see
      * display.c). The renderer therefore no longer exports an MTLDevice here
      * (that used to depend on VK_EXT_metal_objects, which KosmicKrisp lacks). */
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+    report_metal_texture_export_support(r->physical_device);
+#endif
 
     return true;
 }
