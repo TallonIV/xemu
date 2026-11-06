@@ -548,16 +548,13 @@ static void destroy_current_display_image(PGRAPHState *pg)
     destroy_frame_buffer(pg);
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* vkExportMetalObjectsEXT() returns the MTLTexture with a +1 retain count
-     * that belongs to us (see VK_EXT_metal_objects "Safe-Returned Objects"),
-     * so we took ownership in create_display_image(). Release it before the
-     * backing VkImage (and its underlying MTLTexture) is destroyed below. The
-     * Metal presenter drains in-flight GPU work before the renderer is
-     * finalized, so no command buffer can still reference it here. */
-    if (d->mtl_texture) {
-        objc_release(d->mtl_texture);
-        d->mtl_texture = NULL;
-    }
+    /* The framebuffer MTLTexture is an external-memory handle borrowed from
+     * d->memory (VK_EXT_external_memory_metal), not a +1 safe-returned object,
+     * so it must NOT be objc_release()'d. Just drop our reference; the texture
+     * goes away with vkDestroyImage()/vkFreeMemory() below. The Metal presenter
+     * is synchronized to drain in-flight GPU work before this runs, so no
+     * command buffer can still reference it here. */
+    d->mtl_texture = NULL;
 #elif HAVE_EXTERNAL_MEMORY
     glDeleteTextures(1, &d->gl_texture_id);
     d->gl_texture_id = 0;
@@ -634,26 +631,22 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
 
-#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* Declare that this image's underlying MTLTexture should be exportable via
-     * VK_EXT_metal_objects. The handle is fetched after memory binding. */
-    VkExportMetalObjectCreateInfoEXT export_metal_texture_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
-        .pNext = NULL,
-        .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
-    };
-    image_create_info.pNext = &export_metal_texture_info;
-#else
+    /* Declare that this image's memory should be exportable so the display API
+     * can wrap the same allocation. On Apple Silicon the framebuffer MTLTexture
+     * is handed to the Metal presenter via VK_EXT_external_memory_metal
+     * (KosmicKrisp does not expose VK_EXT_metal_objects); the handle is fetched
+     * after memory binding. */
     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-#ifdef WIN32
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+#elif defined(WIN32)
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
 #else
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR,
 #endif
     };
     image_create_info.pNext = &external_memory_image_create_info;
-#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -669,11 +662,12 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
 
-#if !(defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT))
     VkExportMemoryAllocateInfo export_memory_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
         .handleTypes =
-#ifdef WIN32
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT
+#elif defined(WIN32)
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR
 #else
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
@@ -681,7 +675,6 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
             ,
     };
     alloc_info.pNext = &export_memory_alloc_info;
-#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -700,26 +693,22 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                &d->image_view));
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    VkExportMetalTextureInfoEXT metal_texture_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
-        .pNext = NULL,
-        .image = d->image,
-        .imageView = VK_NULL_HANDLE,
-        .bufferView = VK_NULL_HANDLE,
-        .plane = VK_IMAGE_ASPECT_COLOR_BIT,
-        .mtlTexture = NULL,
+    /* Export the bound image memory as an MTLTexture handle via
+     * VK_EXT_external_memory_metal. The returned handle is an id<MTLTexture>
+     * that borrows the VkDeviceMemory lifetime: it is NOT a +1 safe-returned
+     * object (unlike VK_EXT_metal_objects), so it must not be objc_release()'d.
+     * It stays valid only while d->memory / d->image remain alive; the Metal
+     * presenter is synchronized to drain in-flight GPU work before the renderer
+     * recreates or destroys them. */
+    VkMemoryGetMetalHandleInfoEXT get_handle_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+        .memory = d->memory,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
     };
-    VkExportMetalObjectsInfoEXT metal_objects_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-        .pNext = &metal_texture_info,
-    };
-    vkExportMetalObjectsEXT(r->device, &metal_objects_info);
-
-    /* Safe-returned object: mtlTexture arrives with +1 and we own it. Keep that
-     * reference (balanced by objc_release() in destroy_current_display_image())
-     * so the texture stays alive for the Metal presenter even if the backing
-     * VkImage is recreated (e.g. a guest resolution change) mid-frame. */
-    d->mtl_texture = metal_texture_info.mtlTexture;
+    void *mtl_texture_handle = NULL;
+    VK_CHECK(vkGetMemoryMetalHandleEXT(r->device, &get_handle_info,
+                                       &mtl_texture_handle));
+    d->mtl_texture = mtl_texture_handle;
     assert(d->mtl_texture);
     d->gl_texture_id = 0;
 #elif HAVE_EXTERNAL_MEMORY

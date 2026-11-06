@@ -304,7 +304,8 @@ typedef struct PGRAPHVkDisplayState {
     GLuint gl_texture_id;
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    // Metal Interop (VK_EXT_metal_objects)
+    // Metal Interop (VK_EXT_external_memory_metal). Borrowed handle to the
+    // framebuffer MTLTexture exported from the display image's VkDeviceMemory.
     MTLTexture_id mtl_texture;
 #endif
 } PGRAPHVkDisplayState;
@@ -342,8 +343,9 @@ typedef struct PGRAPHVkState {
     bool memory_budget_extension_enabled;
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    // Metal Interop (VK_EXT_metal_objects). Retained reference to the
-    // safe-returned device (see create_logical_device()).
+    /* Legacy VK_EXT_metal_objects device handle. The present path now uses
+     * VK_EXT_external_memory_metal and the Metal presenter owns its own
+     * MTLDevice, so the renderer no longer populates or releases this field. */
     MTLDevice_id mtl_device;
 
     // Handle of the dlopen()'ed Vulkan loader (macOS loader discovery).

@@ -41,11 +41,14 @@ static char const *const required_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 #elif defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* On Apple Silicon the framebuffer is handed to the Metal compositor via
-     * VK_EXT_metal_objects. Requiring it here makes driver support an explicit
-     * gate: if the ICD (e.g. KosmicKrisp) does not expose it, Vulkan renderer
-     * initialization fails cleanly and the user remains on OpenGL. */
-    VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
+    /* On Apple Silicon the framebuffer is handed to the Metal compositor by
+     * exporting the display image memory as an MTLTexture via
+     * VK_EXT_external_memory_metal. Requiring it here makes driver support an
+     * explicit gate: if the ICD does not expose it, Vulkan renderer
+     * initialization fails cleanly and the user remains on OpenGL. Note that
+     * KosmicKrisp advertises VK_EXT_external_memory_metal but NOT
+     * VK_EXT_metal_objects, so we deliberately depend on the former. */
+    VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
@@ -413,6 +416,48 @@ static bool check_device_support_required_extensions(VkPhysicalDevice device)
     return true;
 }
 
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+/* Verify the physical device can export the offscreen framebuffer as an
+ * MTLTexture via VK_EXT_external_memory_metal. This is the mechanism the Metal
+ * presenter uses to sample the Vulkan-rendered image, so a device that
+ * advertises the extension but not the MTLTEXTURE export handle type must be
+ * rejected here rather than failing later at display image creation. These
+ * entry points are core in Vulkan 1.1+, which is already required above. */
+static bool check_device_supports_metal_texture_export(VkPhysicalDevice device)
+{
+    VkExternalImageFormatProperties external_properties = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+    };
+
+    VkImageCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+    };
+
+    VkResult result = vkGetPhysicalDeviceExternalImageFormatProperties(
+        device, &create_info, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+        &external_properties);
+
+    const VkExternalMemoryProperties *ext_mem =
+        &external_properties.externalMemoryProperties;
+    if (result != VK_SUCCESS ||
+        !(ext_mem->compatibleHandleTypes &
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) ||
+        !(ext_mem->externalMemoryFeatures &
+          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+        fprintf(stderr,
+                "device does not support VK_EXT_external_memory_metal "
+                "MTLTEXTURE export for the framebuffer\n");
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 static bool check_device_support_required_formats(VkPhysicalDevice device)
 {
     const VkFormatFeatureFlags required_features =
@@ -485,6 +530,9 @@ static bool is_device_compatible(VkPhysicalDevice device)
 
     return is_queue_family_indicies_complete(indices) &&
            check_device_support_required_extensions(device) &&
+#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
+           check_device_supports_metal_texture_export(device) &&
+#endif
            check_device_support_required_formats(device);
     // FIXME: Check vram
 }
@@ -677,35 +725,11 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
 
     vkGetDeviceQueue(r->device, indices.queue_family, 0, &r->queue);
 
-#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-    /* Export the underlying MTLDevice so the Metal presentation layer can
-     * create pipelines on the same device that owns the exported MTLTextures. */
-    VkExportMetalDeviceInfoEXT metal_device_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
-        .pNext = NULL,
-    };
-    VkExportMetalObjectsInfoEXT metal_objects_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
-        .pNext = &metal_device_info,
-    };
-    vkExportMetalObjectsEXT(r->device, &metal_objects_info);
-
-    /* Feasibility gate result (macOS Metal present path). VK_EXT_metal_objects
-     * is a required device extension, so reaching this point means it is
-     * present; image MTLTexture export is validated later in the display path. */
-    if (!metal_device_info.mtlDevice) {
-        error_setg(errp, "Failed to export MTLDevice via VK_EXT_metal_objects");
-        return false;
-    }
-
-    /* Safe-returned object: the device arrives with a +1 retain count owned by
-     * us. This file is compiled in non-ARC C mode, so the pointer already has
-     * exactly the +1 we need - store it directly (no objc_retain) and balance
-     * it with a single objc_release() in pgraph_vk_finalize_instance(). */
-    r->mtl_device = metal_device_info.mtlDevice;
-    fprintf(stderr, "Metal interop gate: VK_EXT_metal_objects=required+enabled, "
-                    "MTLDevice export=ok\n");
-#endif
+    /* NOTE: The Metal presenter owns its own MTLDevice via
+     * MTLCreateSystemDefaultDevice(), and the framebuffer reaches it as an
+     * exported MTLTexture handle (VK_EXT_external_memory_metal, see
+     * display.c). The renderer therefore no longer exports an MTLDevice here
+     * (that used to depend on VK_EXT_metal_objects, which KosmicKrisp lacks). */
 
     return true;
 }
@@ -787,15 +811,6 @@ void pgraph_vk_finalize_instance(PGRAPHState *pg)
     }
 
     if (r->device != VK_NULL_HANDLE) {
-#if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
-        /* Balance the +1 reference taken on the exported MTLDevice. The Metal
-         * presenter has already drained its queue by this point (renderer
-         * finalize runs after UI teardown). */
-        if (r->mtl_device) {
-            objc_release(r->mtl_device);
-            r->mtl_device = NULL;
-        }
-#endif
         vkDestroyDevice(r->device, NULL);
         r->device = VK_NULL_HANDLE;
     }
