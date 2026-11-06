@@ -339,8 +339,14 @@ typedef struct PGRAPHVkState {
     int debug_depth;
 
     bool debug_utils_extension_enabled;
+    bool portability_enumeration_extension_enabled;
     bool custom_border_color_extension_enabled;
     bool memory_budget_extension_enabled;
+
+    /* False on drivers without the geometryShader feature (Metal-based
+     * drivers such as MoltenVK and KosmicKrisp). Drives the CPU-side
+     * primitive emulation and conditional geometry shader pipeline paths. */
+    bool supports_geometry_shaders;
 
 #if defined(__APPLE__) && defined(VK_USE_PLATFORM_METAL_EXT)
     /* Legacy VK_EXT_metal_objects device handle. The present path now uses

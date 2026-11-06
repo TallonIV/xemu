@@ -103,6 +103,10 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
     state->z_perspective = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                            NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE;
 
+    /* Only the Vulkan backend flips this when the geometry shader stage was
+     * skipped on drivers without geometry shader support. */
+    state->use_hw_depth = false;
+
     state->smooth_shading = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3),
                                      NV_PGRAPH_CONTROL_3_SHADEMODE) ==
                             NV_PGRAPH_CONTROL_3_SHADEMODE_SMOOTH;
@@ -1022,7 +1026,19 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (ps->state->use_hw_depth) {
+        /* The geometry shader stage that provides vtxPos0/1/2 and triMZ was
+         * skipped (Metal drivers lack geometry shader support). Fall back to
+         * hardware-interpolated depth from gl_FragCoord.z, scaled into the
+         * NV2A clip range, and approximate the triMZ slope with dFdx/dFdy. */
+        mstring_append(clip,
+                       "float zvalue = gl_FragCoord.z * clipRange.y;\n"
+                       "float hw_dzdx = dFdx(gl_FragCoord.z) * clipRange.y;\n"
+                       "float hw_dzdy = dFdy(gl_FragCoord.z) * clipRange.y;\n"
+                       "float hw_maxSlope = max(abs(hw_dzdx), abs(hw_dzdy));\n"
+                       "zvalue += depthOffset;\n"
+                       "zvalue += depthFactor * hw_maxSlope;\n");
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"

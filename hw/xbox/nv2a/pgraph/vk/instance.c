@@ -30,6 +30,18 @@
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
 
+/* Older Vulkan headers may lack the portability extension name macros even
+ * when the runtime loader supports them (needed for MoltenVK enumeration). */
+#ifndef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+#define VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+#endif
+#ifndef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
+#define VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME "VK_KHR_portability_enumeration"
+#endif
+#ifndef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+#define VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR 0x00000001u
+#endif
+
 static bool enable_validation = false;
 
 static char const *const validation_layers[] = {
@@ -156,6 +168,15 @@ add_optional_instance_extension_names(PGRAPHState *pg,
         g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+#ifdef __APPLE__
+    /* Without the portability enumeration flag, the loader hides MoltenVK
+     * (a portability driver) entirely. Optional so non-portability drivers
+     * such as KosmicKrisp are unaffected. */
+    r->portability_enumeration_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
 }
 
 #if defined(VK_API_VERSION_1_4)
@@ -266,6 +287,12 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
         .ppEnabledExtensionNames =
             &g_array_index(enabled_extension_names, const char *, 0),
     };
+
+#ifdef __APPLE__
+    if (r->portability_enumeration_extension_enabled) {
+        create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#endif
 
     enable_validation = g_config.display.vulkan.validation_layers;
 
@@ -397,6 +424,14 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+#ifdef __APPLE__
+    /* MoltenVK expects apps to explicitly enable the portability subset to
+     * acknowledge its limitations. KosmicKrisp/Mesa does not offer it, so it
+     * must stay optional and never gate device selection. */
+    add_extension_if_available(available_extensions, enabled_extension_names,
+                               VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+#endif
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -663,6 +698,22 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
             .enabled = &r->enabled_physical_device_features.n, \
             .required = req, \
         }
+        /* Metal-based drivers (MoltenVK, KosmicKrisp) report these features
+         * as unsupported. Each is compensated by a runtime fallback:
+         * geometryShader by CPU primitive emulation (draw.c) and conditional
+         * shader pipeline generation (shaders.c); fillModeNonSolid by clamping
+         * polygonMode; the rest by feature-gated paths below. Keep the strict
+         * desktop requirements untouched. */
+#ifdef __APPLE__
+        F(depthClamp, false),
+        F(fillModeNonSolid, false),
+        F(geometryShader, false),
+        F(occlusionQueryPrecise, false),
+        F(samplerAnisotropy, false),
+        F(shaderClipDistance, true),
+        F(shaderTessellationAndGeometryPointSize, false),
+        F(wideLines, false),
+#else
         F(depthClamp, true),
         F(fillModeNonSolid, true),
         F(geometryShader, true),
@@ -671,6 +722,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(shaderClipDistance, true),
         F(shaderTessellationAndGeometryPointSize, true),
         F(wideLines, false),
+#endif
         #undef F
         // clang-format on
     };
@@ -691,6 +743,9 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         error_setg(errp, "Device does not support required features");
         return false;
     }
+
+    r->supports_geometry_shaders =
+        r->enabled_physical_device_features.geometryShader == VK_TRUE;
 
     void *next_struct = NULL;
 

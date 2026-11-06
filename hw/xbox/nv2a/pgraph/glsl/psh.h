@@ -70,6 +70,12 @@ typedef struct PshState {
     bool depth_clipping;
     bool z_perspective;
 
+    /* Set when the geometry shader stage that normally computes vtxPos0/1/2
+     * and triMZ per-triangle was skipped (e.g. Metal drivers without geometry
+     * shader support). The pixel shader then falls back to
+     * hardware-interpolated depth. */
+    bool use_hw_depth;
+
     unsigned int surface_zeta_format;
     enum PshDepthFormat depth_format;
 } PshState;

@@ -264,7 +264,12 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
 
     ShaderModuleCacheKey key;
 
-    bool need_geometry_shader = pgraph_glsl_need_geom(&binding->state.geom);
+    /* Metal drivers report no geometryShader feature (and MoltenVK/KosmicKrisp
+     * fail pipeline creation with a GS stage). Skip generating and binding the
+     * geometry shader there; the CPU-side primitive emulation in draw.c and the
+     * hardware depth fallback in the pixel shader take over its role. */
+    bool geom_needed = pgraph_glsl_need_geom(&binding->state.geom);
+    bool need_geometry_shader = r->supports_geometry_shaders && geom_needed;
     if (need_geometry_shader) {
         memset(&key, 0, sizeof(key));
         key.kind = VK_SHADER_STAGE_GEOMETRY_BIT;
@@ -288,6 +293,9 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     memset(&key, 0, sizeof(key));
     key.kind = VK_SHADER_STAGE_FRAGMENT_BIT;
     key.psh.state = binding->state.psh;
+    /* If the geometry shader that normally supplies vtxPos0/1/2 and triMZ was
+     * bypassed, tell the pixel shader to derive depth from gl_FragCoord.z. */
+    key.psh.state.use_hw_depth = geom_needed && !need_geometry_shader;
     key.psh.glsl_opts.vulkan = true;
     key.psh.glsl_opts.ubo_binding = PSH_UBO_BINDING;
     key.psh.glsl_opts.tex_binding = PSH_TEX_BINDING;

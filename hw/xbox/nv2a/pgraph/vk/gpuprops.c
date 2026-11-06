@@ -100,26 +100,34 @@ static VkPipeline create_test_pipeline(
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    VkPipelineShaderStageCreateInfo shader_stages[] = {
+    VkPipelineShaderStageCreateInfo shader_stages[3] = { 0 };
+    int num_shader_stages = 0;
+
+    shader_stages[num_shader_stages++] =
         (VkPipelineShaderStageCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_VERTEX_BIT,
             .module = vert_shader_module,
             .pName = "main",
-        },
-        (VkPipelineShaderStageCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_GEOMETRY_BIT,
-            .module = geom_shader_module,
-            .pName = "main",
-        },
+        };
+    /* Metal-based drivers cannot create pipelines with a geometry shader
+     * stage; the probe then runs vertex to fragment directly. */
+    if (r->supports_geometry_shaders) {
+        shader_stages[num_shader_stages++] =
+            (VkPipelineShaderStageCreateInfo){
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_GEOMETRY_BIT,
+                .module = geom_shader_module,
+                .pName = "main",
+            };
+    }
+    shader_stages[num_shader_stages++] =
         (VkPipelineShaderStageCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
             .module = frag_shader_module,
             .pName = "main",
-        },
-    };
+        };
 
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -188,7 +196,7 @@ static VkPipeline create_test_pipeline(
 
     VkGraphicsPipelineCreateInfo pipeline_info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount = ARRAY_SIZE(shader_stages),
+        .stageCount = num_shader_stages,
         .pStages = shader_stages,
         .pVertexInputState = &vertex_input_info,
         .pInputAssemblyState = &input_assembly,

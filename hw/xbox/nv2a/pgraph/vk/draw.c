@@ -54,6 +54,34 @@ static VkPrimitiveTopology get_primitive_topology(PGRAPHState *pg)
     int polygon_mode = r->shader_binding->state.geom.polygon_front_mode;
     int primitive_mode = r->shader_binding->state.geom.primitive_mode;
 
+    /* Metal-based drivers cannot execute the geometry shaders that normally
+     * expand these primitives (adjacency topologies also require the GS
+     * feature). Map directly to plain topologies; the vertex expansion itself
+     * happens on the CPU in build_emulated_indices_* below. */
+    if (!r->supports_geometry_shaders) {
+        switch (primitive_mode) {
+        case PRIM_TYPE_LINE_LOOP:
+            return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        case PRIM_TYPE_QUADS:
+        case PRIM_TYPE_QUAD_STRIP:
+        case PRIM_TYPE_TRIANGLES:
+            if (polygon_mode == POLY_MODE_FILL) {
+                return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            } else if (polygon_mode == POLY_MODE_LINE) {
+                return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            } else {
+                return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+            }
+        case PRIM_TYPE_POLYGON:
+            if (polygon_mode == POLY_MODE_LINE) {
+                return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
     // FIXME: Replace with LUT
     switch (primitive_mode) {
     case PRIM_TYPE_POINTS:
@@ -87,6 +115,300 @@ static VkPrimitiveTopology get_primitive_topology(PGRAPHState *pg)
         assert(!"Invalid primitive_mode");
         return 0;
     }
+}
+
+/*
+ * CPU-side primitive emulation for drivers without geometry shader support
+ * (e.g. Metal-based MoltenVK and KosmicKrisp). The generated geometry shaders
+ * normally expand quads and line loops and rotate vertices to satisfy NV2A's
+ * provoking vertex convention; without a GS stage the same work is done here
+ * by generating replacement index streams.
+ *
+ * Primitive and polygon modes are read directly from hardware registers
+ * rather than the possibly stale shader binding state, matching the behavior
+ * of the GS generation path at draw time.
+ */
+static bool draw_needs_primitive_emulation(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (r->supports_geometry_shaders) {
+        return false;
+    }
+
+    int polygon_mode = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+                                NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    int primitive_mode = pg->primitive_mode;
+
+    switch (primitive_mode) {
+    case PRIM_TYPE_LINE_LOOP:
+    case PRIM_TYPE_QUADS:
+    case PRIM_TYPE_QUAD_STRIP:
+        return true;
+    case PRIM_TYPE_TRIANGLES: {
+        /* Metal has no provoking vertex control and always provokes the last
+         * vertex of the triangle. When NV2A expects first-vertex provoking,
+         * rotate the indices on the CPU to deliver the same result. */
+        bool first_vertex = (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) &
+                             NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX) ==
+                            NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX_FIRST;
+        return first_vertex;
+    }
+    case PRIM_TYPE_POLYGON:
+        return polygon_mode == POLY_MODE_LINE;
+    default:
+        return false;
+    }
+}
+
+static size_t get_max_emulated_index_count(PGRAPHState *pg, uint32_t in_count)
+{
+    int polygon_mode = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+                                NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    int primitive_mode = pg->primitive_mode;
+
+    size_t result = 0;
+    switch (primitive_mode) {
+    case PRIM_TYPE_LINE_LOOP:
+        result = in_count > 1 ? in_count * 2 : 0;
+        break;
+    case PRIM_TYPE_QUADS: {
+        size_t quads = in_count / 4;
+        if (polygon_mode == POLY_MODE_FILL) {
+            result = quads * 6;
+        } else if (polygon_mode == POLY_MODE_LINE) {
+            result = quads * 8;
+        } else {
+            result = quads * 4;
+        }
+        break;
+    }
+    case PRIM_TYPE_QUAD_STRIP: {
+        size_t quads = in_count >= 4 ? (in_count - 2) / 2 : 0;
+        if (polygon_mode == POLY_MODE_FILL) {
+            result = quads * 6;
+        } else if (polygon_mode == POLY_MODE_LINE) {
+            result = quads * 8;
+        } else {
+            result = quads * 4;
+        }
+        break;
+    }
+    case PRIM_TYPE_TRIANGLES:
+        result = in_count;
+        break;
+    case PRIM_TYPE_POLYGON:
+        result =
+            (polygon_mode == POLY_MODE_LINE && in_count > 1) ? in_count * 2 : 0;
+        break;
+    default:
+        result = 0;
+        break;
+    }
+
+    return result;
+}
+
+static size_t build_emulated_indices_from_array(PGRAPHState *pg, uint32_t start,
+                                                uint32_t count, uint32_t *out)
+{
+    int polygon_mode = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+                                NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    int primitive_mode = pg->primitive_mode;
+    size_t j = 0;
+
+#define EMIT2(a, b)     \
+    do {                \
+        out[j++] = (a); \
+        out[j++] = (b); \
+    } while (0)
+#define EMIT3(a, b, c)  \
+    do {                \
+        out[j++] = (a); \
+        out[j++] = (b); \
+        out[j++] = (c); \
+    } while (0)
+#define EMIT4(a, b, c, d) \
+    do {                  \
+        out[j++] = (a);   \
+        out[j++] = (b);   \
+        out[j++] = (c);   \
+        out[j++] = (d);   \
+    } while (0)
+
+    switch (primitive_mode) {
+    case PRIM_TYPE_LINE_LOOP:
+    case PRIM_TYPE_POLYGON:
+        if (count <= 1) {
+            break;
+        }
+        for (uint32_t i = 0; i < count - 1; i++) {
+            EMIT2(start + i, start + i + 1);
+        }
+        EMIT2(start + count - 1, start);
+        break;
+    case PRIM_TYPE_QUADS:
+        for (uint32_t i = 0; i + 3 < count; i += 4) {
+            uint32_t v0 = start + i;
+            uint32_t v1 = start + i + 1;
+            uint32_t v2 = start + i + 2;
+            uint32_t v3 = start + i + 3;
+            if (polygon_mode == POLY_MODE_FILL) {
+                EMIT3(v0, v1, v3);
+                EMIT3(v1, v2, v3);
+            } else if (polygon_mode == POLY_MODE_LINE) {
+                EMIT2(v0, v1);
+                EMIT2(v1, v2);
+                EMIT2(v2, v3);
+                EMIT2(v3, v0);
+            } else {
+                EMIT4(v0, v1, v2, v3);
+            }
+        }
+        break;
+    case PRIM_TYPE_QUAD_STRIP:
+        for (uint32_t i = 0; i + 3 < count; i += 2) {
+            uint32_t v0 = start + i;
+            uint32_t v1 = start + i + 1;
+            uint32_t v2 = start + i + 2;
+            uint32_t v3 = start + i + 3;
+            if (polygon_mode == POLY_MODE_FILL) {
+                EMIT3(v0, v1, v3);
+                EMIT3(v0, v3, v2);
+            } else if (polygon_mode == POLY_MODE_LINE) {
+                EMIT2(v0, v1);
+                EMIT2(v1, v3);
+                EMIT2(v3, v2);
+                EMIT2(v2, v0);
+            } else {
+                EMIT4(v0, v1, v2, v3);
+            }
+        }
+        break;
+    case PRIM_TYPE_TRIANGLES: {
+        bool first_vertex = (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) &
+                             NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX) ==
+                            NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX_FIRST;
+        if (first_vertex && polygon_mode == POLY_MODE_FILL) {
+            /* Replicate the geometry shader's vertex rotation so that v0
+             * (the NV2A first-vertex provoking source) lands in the provoking
+             * position used by Metal's last-vertex convention. */
+            for (uint32_t i = 0; i + 2 < count; i += 3) {
+                uint32_t v0 = start + i;
+                uint32_t v1 = start + i + 1;
+                uint32_t v2 = start + i + 2;
+                EMIT3(v1, v2, v0);
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+#undef EMIT4
+#undef EMIT3
+#undef EMIT2
+    return j;
+}
+
+static size_t build_emulated_indices_from_elements(PGRAPHState *pg,
+                                                   const uint32_t *in,
+                                                   uint32_t in_count,
+                                                   uint32_t *out)
+{
+    int polygon_mode = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+                                NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    int primitive_mode = pg->primitive_mode;
+    size_t j = 0;
+
+#define EMIT2(a, b)     \
+    do {                \
+        out[j++] = (a); \
+        out[j++] = (b); \
+    } while (0)
+#define EMIT3(a, b, c)  \
+    do {                \
+        out[j++] = (a); \
+        out[j++] = (b); \
+        out[j++] = (c); \
+    } while (0)
+#define EMIT4(a, b, c, d) \
+    do {                  \
+        out[j++] = (a);   \
+        out[j++] = (b);   \
+        out[j++] = (c);   \
+        out[j++] = (d);   \
+    } while (0)
+
+    switch (primitive_mode) {
+    case PRIM_TYPE_LINE_LOOP:
+    case PRIM_TYPE_POLYGON:
+        if (in_count <= 1) {
+            break;
+        }
+        for (uint32_t i = 0; i < in_count - 1; i++) {
+            EMIT2(in[i], in[i + 1]);
+        }
+        EMIT2(in[in_count - 1], in[0]);
+        break;
+    case PRIM_TYPE_QUADS:
+        for (uint32_t i = 0; i + 3 < in_count; i += 4) {
+            uint32_t v0 = in[i];
+            uint32_t v1 = in[i + 1];
+            uint32_t v2 = in[i + 2];
+            uint32_t v3 = in[i + 3];
+            if (polygon_mode == POLY_MODE_FILL) {
+                EMIT3(v0, v1, v3);
+                EMIT3(v1, v2, v3);
+            } else if (polygon_mode == POLY_MODE_LINE) {
+                EMIT2(v0, v1);
+                EMIT2(v1, v2);
+                EMIT2(v2, v3);
+                EMIT2(v3, v0);
+            } else {
+                EMIT4(v0, v1, v2, v3);
+            }
+        }
+        break;
+    case PRIM_TYPE_QUAD_STRIP:
+        for (uint32_t i = 0; i + 3 < in_count; i += 2) {
+            uint32_t v0 = in[i];
+            uint32_t v1 = in[i + 1];
+            uint32_t v2 = in[i + 2];
+            uint32_t v3 = in[i + 3];
+            if (polygon_mode == POLY_MODE_FILL) {
+                EMIT3(v0, v1, v3);
+                EMIT3(v0, v3, v2);
+            } else if (polygon_mode == POLY_MODE_LINE) {
+                EMIT2(v0, v1);
+                EMIT2(v1, v3);
+                EMIT2(v3, v2);
+                EMIT2(v2, v0);
+            } else {
+                EMIT4(v0, v1, v2, v3);
+            }
+        }
+        break;
+    case PRIM_TYPE_TRIANGLES: {
+        bool first_vertex = (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) &
+                             NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX) ==
+                            NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX_FIRST;
+        if (first_vertex && polygon_mode == POLY_MODE_FILL) {
+            for (uint32_t i = 0; i + 2 < in_count; i += 3) {
+                EMIT3(in[i + 1], in[i + 2], in[i]);
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+#undef EMIT4
+#undef EMIT3
+#undef EMIT2
+    return j;
 }
 
 static void pipeline_cache_entry_init(Lru *lru, LruNode *node,
@@ -790,7 +1112,8 @@ static void create_pipeline(PGRAPHState *pg)
 
     VkPipelineRasterizationStateCreateInfo rasterizer = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .depthClampEnable = VK_TRUE,
+        .depthClampEnable =
+            r->enabled_physical_device_features.depthClamp ? VK_TRUE : VK_FALSE,
         .rasterizerDiscardEnable = VK_FALSE,
         .polygonMode = pgraph_polygon_mode_vk_map[r->shader_binding->state
                                                       .geom.polygon_front_mode],
@@ -802,6 +1125,14 @@ static void create_pipeline(PGRAPHState *pg)
         .depthBiasEnable = VK_FALSE,
         .pNext = rasterizer_next_struct,
     };
+
+    /* Non-fill polygon modes require the fillModeNonSolid feature, which
+     * Metal-based drivers lack; the emulated line/point topologies above
+     * cover those cases, so clamp any remaining requests back to fill. */
+    if (!r->enabled_physical_device_features.fillModeNonSolid &&
+        rasterizer.polygonMode != VK_POLYGON_MODE_FILL) {
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    }
 
     if (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) & NV_PGRAPH_SETUPRASTER_CULLENABLE) {
         uint32_t cull_face = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
@@ -1067,8 +1398,12 @@ static void begin_query(PGRAPHVkState *r)
     nv2a_profile_inc_counter(NV2A_PROF_QUERY);
     vkCmdResetQueryPool(r->command_buffer, r->query_pool,
                         r->num_queries_in_flight, 1);
+    VkQueryControlFlags query_flags = 0;
+    if (r->enabled_physical_device_features.occlusionQueryPrecise) {
+        query_flags |= VK_QUERY_CONTROL_PRECISE_BIT;
+    }
     vkCmdBeginQuery(r->command_buffer, r->query_pool, r->num_queries_in_flight,
-                    VK_QUERY_CONTROL_PRECISE_BIT);
+                    query_flags);
 
     r->query_in_flight = true;
     r->new_query_needed = false;
@@ -2051,17 +2386,55 @@ void pgraph_vk_flush_draw(NV2AState *d)
         sync_vertex_ram_buffer(pg);
         VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
 
+        bool emulate_primitives = draw_needs_primitive_emulation(pg);
+        if (emulate_primitives) {
+            size_t total_index_count = 0;
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                total_index_count += get_max_emulated_index_count(
+                    pg, pg->draw_arrays_count[i]);
+            }
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
+                                total_index_count * sizeof(uint32_t));
+        }
+
         begin_pre_draw(pg);
         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Draw Arrays");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        for (int i = 0; i < pg->draw_arrays_length; i++) {
-            uint32_t start = pg->draw_arrays_start[i],
-                     count = pg->draw_arrays_count[i];
-            NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
+        if (emulate_primitives) {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                uint32_t start = pg->draw_arrays_start[i];
+                uint32_t count = pg->draw_arrays_count[i];
+                size_t max_index_count =
+                    get_max_emulated_index_count(pg, count);
+                if (max_index_count == 0) {
+                    continue;
+                }
+
+                g_autofree uint32_t *indices =
+                    g_malloc_n(max_index_count, sizeof(indices[0]));
+                size_t index_count = build_emulated_indices_from_array(
+                    pg, start, count, indices);
+                if (index_count == 0) {
+                    continue;
+                }
+
+                VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
+                    pg, indices, index_count * sizeof(indices[0]));
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     buffer_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, index_count, 1, 0, 0, 0);
+            }
+        } else {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                uint32_t start = pg->draw_arrays_start[i],
+                         count = pg->draw_arrays_count[i];
+                NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
+                vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            }
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2074,8 +2447,13 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
 
-        size_t index_data_size =
-            pg->inline_elements_length * sizeof(pg->inline_elements[0]);
+        bool emulate_primitives = draw_needs_primitive_emulation(pg);
+        size_t index_count = pg->inline_elements_length;
+        if (emulate_primitives) {
+            index_count =
+                get_max_emulated_index_count(pg, pg->inline_elements_length);
+        }
+        size_t index_data_size = index_count * sizeof(pg->inline_elements[0]);
 
         ensure_buffer_space(pg, BUFFER_INDEX_STAGING, index_data_size);
 
@@ -2093,17 +2471,27 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         begin_pre_draw(pg);
         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element + 1);
-        VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
-            pg, pg->inline_elements, index_data_size);
+        const uint32_t *indices = pg->inline_elements;
+        g_autofree uint32_t *emulated_indices = NULL;
+        if (emulate_primitives) {
+            emulated_indices = g_malloc_n(index_count, sizeof(emulated_indices[0]));
+            index_count = build_emulated_indices_from_elements(
+                pg, pg->inline_elements, pg->inline_elements_length,
+                emulated_indices);
+            indices = emulated_indices;
+        }
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Inline Elements");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        vkCmdBindIndexBuffer(r->command_buffer,
-                             r->storage_buffers[BUFFER_INDEX].buffer,
-                             buffer_offset, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
-                         0);
+        if (index_count > 0) {
+            VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
+                pg, (void *)indices, index_count * sizeof(indices[0]));
+            vkCmdBindIndexBuffer(r->command_buffer,
+                                 r->storage_buffers[BUFFER_INDEX].buffer,
+                                 buffer_offset, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(r->command_buffer, index_count, 1, 0, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2131,6 +2519,14 @@ void pgraph_vk_flush_draw(NV2AState *d)
             attr->inline_buffer_populated = false;
             offset += vertex_data_size;
         }
+        bool emulate_primitives = draw_needs_primitive_emulation(pg);
+        size_t emulated_index_count = 0;
+        if (emulate_primitives) {
+            emulated_index_count =
+                get_max_emulated_index_count(pg, pg->inline_buffer_length);
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
+                                emulated_index_count * sizeof(uint32_t));
+        }
         ensure_buffer_space(pg, BUFFER_VERTEX_INLINE_STAGING, offset);
 
         begin_pre_draw(pg);
@@ -2140,7 +2536,22 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Buffer");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        if (emulate_primitives) {
+            g_autofree uint32_t *indices =
+                g_malloc_n(emulated_index_count, sizeof(indices[0]));
+            size_t index_count = build_emulated_indices_from_array(
+                pg, 0, pg->inline_buffer_length, indices);
+            if (index_count > 0) {
+                VkDeviceSize index_offset = pgraph_vk_update_index_buffer(
+                    pg, indices, index_count * sizeof(indices[0]));
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, index_count, 1, 0, 0, 0);
+            }
+        } else {
+            vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2176,6 +2587,15 @@ void pgraph_vk_flush_draw(NV2AState *d)
         pgraph_vk_bind_vertex_attributes(d, 0, index_count - 1, true,
                                          vertex_size, index_count - 1);
 
+        bool emulate_primitives = draw_needs_primitive_emulation(pg);
+        size_t emulated_index_count = 0;
+        if (emulate_primitives) {
+            emulated_index_count =
+                get_max_emulated_index_count(pg, index_count);
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
+                                emulated_index_count * sizeof(uint32_t));
+        }
+
         begin_pre_draw(pg);
         void *inline_array_data = pg->inline_array;
         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
@@ -2184,7 +2604,23 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Array");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        if (emulate_primitives) {
+            g_autofree uint32_t *indices =
+                g_malloc_n(emulated_index_count, sizeof(indices[0]));
+            size_t actual_index_count =
+                build_emulated_indices_from_array(pg, 0, index_count, indices);
+            if (actual_index_count > 0) {
+                VkDeviceSize index_offset = pgraph_vk_update_index_buffer(
+                    pg, indices, actual_index_count * sizeof(indices[0]));
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, actual_index_count, 1, 0, 0,
+                                 0);
+            }
+        } else {
+            vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
         NV2A_VK_DGROUP_END();
